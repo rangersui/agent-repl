@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+r"""
+km — interrupt-driven monitor for k sessions.
+
+Watches a tmux session via pipe-pane (not polling).
+Outputs structured JSON events to stdout.
+Each stdout line → one Monitor notification → agent interrupt.
+
+Usage:
+  km <session> [cell_id] [-1]
+
+  session    tmux session to watch
+  cell_id    only match this cell (optional, matches any cell if omitted)
+  -1         exit after first completion (one-shot / .then())
+
+Examples:
+  km work abc123 -1          ← await one cell
+  km work -1                 ← await any cell completion
+  km work                    ← continuous, all completions
+
+Architecture:
+  tmux pipe-pane → log file → tail -f → parse → JSON event → stdout
+  No polling. Interrupt-driven end to end.
+  This is the .then() callback mechanism.
+"""
+
+import sys
+import os
+import re
+import json
+import signal
+import subprocess
+import shutil
+import tempfile
+from datetime import datetime, timezone
+
+TMUX = shutil.which("tmux") or "tmux"
+
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;]*[a-zA-Z]"
+    r"|\x1b\[<[0-9;]*[mM]"
+    r"|\x1b\[\?[0-9;]*[hlsr]"
+    r"|\x1b\][^\x07]*\x07"
+    r"|\x1b\][^\x1b]*\x1b\\"
+    r"|\x1b[()][0-9A-B]"
+    r"|\x1b[>=]"
+    r"|\x1b\x50[^\x1b]*\x1b\\"
+    r"|\r"
+)
+
+# cell event patterns (written directly to log by k)
+# fired:  ── cell:<hex12> fired ──
+# done:   ── cell:<hex12> done ──
+# notify: ── notify [...] <message> ──
+START_RE  = re.compile(r"^── cell:([0-9a-f]{12}) fired ──$")
+END_RE    = re.compile(r"^── cell:([0-9a-f]{12}) done ──$")
+NOTIFY_RE = re.compile(r"^── notify \[(.+?)\] (.+) ──$")
+
+
+def _emit(d: dict):
+    """One JSON line to stdout = one agent interrupt."""
+    d["ts"] = datetime.now(timezone.utc).isoformat()
+    sys.stdout.write(json.dumps(d, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+class E:
+    """km event factory."""
+
+    @staticmethod
+    def started(cell_id: str, session: str):
+        _emit({"cell_id": cell_id, "session": session, "status": "fired"})
+
+    @staticmethod
+    def completed(cell_id: str, session: str):
+        _emit({"cell_id": cell_id, "session": session, "status": "done"})
+
+    @staticmethod
+    def notify(session: str, who: str, message: str):
+        _emit({"session": session, "status": "notify", "from": who, "message": message})
+
+    @staticmethod
+    def closed(session: str):
+        _emit({"session": session, "status": "closed"})
+
+    @staticmethod
+    def error(session: str, message: str):
+        _emit({"session": session, "status": "error", "message": message})
+
+
+CELL_DIR = os.path.join("/tmp", "k_cells")
+
+def session_log_path(session: str) -> str:
+    return os.path.join(CELL_DIR, session, "_output.log")
+
+
+def start_pipe(session: str) -> str:
+    """
+    Use k's session log. Start pipe-pane only if log doesn't exist yet.
+    If k already started pipe-pane (via k new), this is a no-op.
+    """
+    logfile = session_log_path(session)
+
+    os.makedirs(os.path.join(CELL_DIR, session), exist_ok=True)
+
+    if not os.path.exists(logfile):
+        # k hasn't started pipe yet — start it ourselves
+        open(logfile, "w").close()
+        subprocess.run(
+            [TMUX, "pipe-pane", "-t", session, "-o", f"cat >> '{logfile}'"],
+            check=True,
+        )
+    # else: log exists → pipe is running → don't touch it
+
+    return logfile
+
+
+def stop_pipe(session: str, logfile: str, tail_proc=None):
+    """Cleanup: kill tail. Don't stop pipe-pane or remove log — k owns those."""
+    if tail_proc and tail_proc.poll() is None:
+        tail_proc.kill()
+        tail_proc.wait()
+    # DON'T stop pipe-pane — k may still need it
+    # DON'T remove log — k owns the session directory
+
+
+def monitor(session: str, cell_id: str = None, oneshot: bool = False):
+    # verify session
+    r = subprocess.run([TMUX, "has-session", "-t", session], capture_output=True)
+    if r.returncode != 0:
+        E.error(session, f"no session '{session}'")
+        return 1
+
+    logfile = start_pipe(session)
+    tail_proc = None
+
+    def cleanup(*_):
+        stop_pipe(session, logfile, tail_proc)
+
+    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
+    signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
+
+    try:
+        # tail -f: interrupt-driven (inotify on linux, kqueue on mac)
+        tail_proc = subprocess.Popen(
+            ["tail", "-n", "0", "-f", logfile],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+
+        # track cells we've seen start (to pair start/end)
+        active_cells = set()
+
+        for raw_line in tail_proc.stdout:
+            line = ANSI_RE.sub("", raw_line).strip()
+            if not line:
+                continue
+
+            # check start
+            m = START_RE.match(line)
+            if m:
+                cid = m.group(1)
+                if cell_id is None or cid == cell_id:
+                    active_cells.add(cid)
+                    E.started(cid, session)
+                continue
+
+            # check done
+            m = END_RE.match(line)
+            if m:
+                cid = m.group(1)
+                if cell_id is None or cid == cell_id:
+                    active_cells.discard(cid)
+                    E.completed(cid, session)
+                    if oneshot:
+                        return 0
+                continue
+
+            # check notify
+            m = NOTIFY_RE.match(line)
+            if m:
+                who, message = m.group(1), m.group(2)
+                E.notify(session, who, message)
+                continue
+
+        # tail ended (session died?)
+        E.closed(session)
+        return 1
+
+    finally:
+        cleanup()
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    session = args[0]
+    cell_id = None
+    oneshot = False
+
+    for arg in args[1:]:
+        if arg == "-1":
+            oneshot = True
+        elif re.match(r"^[0-9a-f]{12}$", arg):
+            cell_id = arg
+        else:
+            print(f"unknown arg: {arg}", file=sys.stderr)
+            return 1
+
+    return monitor(session, cell_id, oneshot)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

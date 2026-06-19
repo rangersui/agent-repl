@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""
+k — structured async execution over PTY for AI agents
+
+Usage:
+  k new    <session> <cmd...> [--prompt="x"]  spawn session
+  k fire   [session] <code> [-t N]            async fire (default 300s)
+  k poll   [session] [cell_id]                poll result
+  k run    [session] <code>                   sync
+  k run -j [session] <code>                   sync, JSON
+  k run -j -t N [session] <code>              sync, timeout
+  k await  ...                                alias for run
+  k notify [session] <message>                notification
+  k int    [session]                          ctrl-c
+  k kill   <session>                          kill + cleanup
+  k ls                                        list sessions
+  k status [session]                          health check
+  k watch  [session]                          live view
+  k history [session] [-n N]                  last N cells
+
+Session resolves: explicit arg → K_SESSION env → auto-detect.
+Any REPL works. Zero config. Frame delimiter = repeated prompt lines.
+"""
+import json, os, re, shutil, subprocess, sys, time, uuid
+
+TMUX = shutil.which("tmux") or "tmux"
+CELL_DIR = "/tmp/k_cells"
+FRAME_ENTERS = 5  # consecutive identical lines to detect frame end
+
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[<[0-9;]*[mM]|\x1b\[\?[0-9;]*[hlsr]"
+    r"|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]"
+    r"|\x1b[>=]|\x1b\x50[^\x1b]*\x1b\\|\x08|\r"
+)
+
+
+# ═══════════════════════════════════════════
+# TMUX
+# ═══════════════════════════════════════════
+
+class T:
+    @staticmethod
+    def spawn(s, cmd):
+        subprocess.run([TMUX, "new-session", "-d", "-s", s, "-x", "10000", "-y", "50"]
+                       + ([cmd] if cmd else []), check=True)
+    @staticmethod
+    def has(s):
+        return subprocess.run([TMUX, "has-session", "-t", s], capture_output=True).returncode == 0
+    @staticmethod
+    def kill(s):
+        subprocess.run([TMUX, "kill-session", "-t", s], capture_output=True)
+    @staticmethod
+    def send(s, text):
+        subprocess.run([TMUX, "send-keys", "-t", s, text, "Enter"], check=True)
+    @staticmethod
+    def send_enter(s):
+        subprocess.run([TMUX, "send-keys", "-t", s, "", "Enter"], check=True)
+    @staticmethod
+    def send_int(s):
+        subprocess.run([TMUX, "send-keys", "-t", s, "C-c"], check=True)
+    @staticmethod
+    def ls():
+        r = subprocess.run([TMUX, "list-sessions", "-F", "#{session_name}"],
+                           capture_output=True, text=True)
+        return r.stdout.strip()
+    @staticmethod
+    def pipe_start(s, logfile):
+        open(logfile, "a").close()
+        subprocess.run([TMUX, "pipe-pane", "-t", s, "-o", f"cat >> '{logfile}'"], check=True)
+    @staticmethod
+    def pipe_stop(s):
+        subprocess.run([TMUX, "pipe-pane", "-t", s], capture_output=True)
+
+
+# ═══════════════════════════════════════════
+# PATHS + HELPERS
+# ═══════════════════════════════════════════
+
+def _meta(s):   return os.path.join(CELL_DIR, s, "_session.json")
+def _lock(s):   return os.path.join(CELL_DIR, s, "_lock.json")
+def _log(s):    return os.path.join(CELL_DIR, s, "_output.log")
+def _result(s, cid): return os.path.join(CELL_DIR, s, f"{cid}_result.json")
+
+def _log_size(s):
+    try: return os.path.getsize(_log(s))
+    except FileNotFoundError: return 0
+
+def _ensure_pipe(s):
+    logpath = _log(s)
+    if os.path.exists(logpath): return
+    os.makedirs(os.path.join(CELL_DIR, s), exist_ok=True)
+    T.pipe_start(s, logpath)
+
+def _log_event(s, event):
+    try:
+        with open(_log(s), "a") as f: f.write(f"\n{event}\n")
+    except OSError: pass
+
+def _resolve(explicit=None):
+    if explicit: return explicit
+    env = os.environ.get("K_SESSION")
+    if env: return env
+    if os.path.isdir(CELL_DIR):
+        ss = [d for d in os.listdir(CELL_DIR) if os.path.isfile(os.path.join(CELL_DIR, d, "_session.json"))]
+        if len(ss) == 1: return ss[0]
+    return None
+
+def _json(d): print(json.dumps(d, ensure_ascii=False))
+
+
+# ═══════════════════════════════════════════
+# SESSION
+# ═══════════════════════════════════════════
+
+def _create(session, cmd, prompt=None):
+    T.spawn(session, cmd)
+    os.makedirs(os.path.join(CELL_DIR, session), exist_ok=True)
+    _ensure_pipe(session)
+    time.sleep(1.0)
+    meta = {"name": session}
+    if prompt:
+        meta["prompt"] = prompt  # explicit prompt → exact match mode
+    with open(_meta(session), "w") as f:
+        json.dump(meta, f)
+
+def _session_exists(session):
+    return T.has(session) and os.path.exists(_meta(session))
+
+def _session_prompt(session):
+    """Returns explicit prompt if set, None for default repeat-detection."""
+    try:
+        with open(_meta(session)) as f: return json.load(f).get("prompt")
+    except: return None
+
+
+# ═══════════════════════════════════════════
+# LOCK = CELL METADATA
+# ═══════════════════════════════════════════
+
+def _acquire(session, cell_id, log_offset, echo_count):
+    lock = _lock(session)
+    meta = {"cell_id": cell_id, "log_offset": log_offset, "echo_count": echo_count}
+    try:
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        os.write(fd, json.dumps(meta).encode())
+        os.close(fd)
+        return None
+    except FileExistsError:
+        try:
+            with open(lock) as f: return json.load(f).get("cell_id", "?")
+        except: return "?"
+
+def _load_cell(session):
+    try:
+        with open(_lock(session)) as f: return json.load(f)
+    except: return None
+
+def _release(session, cell_id):
+    try:
+        with open(_lock(session)) as f:
+            if json.load(f).get("cell_id") == cell_id: os.unlink(_lock(session))
+    except: pass
+
+
+# ═══════════════════════════════════════════
+# STREAM PROCESSOR
+# Frame delimiter: N consecutive identical non-empty lines
+# (= REPL redrawing prompt on empty Enter)
+# ═══════════════════════════════════════════
+
+def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prompt=None):
+    """
+    Stream processor with two modes:
+      prompt=None  → frame delimiter = N consecutive identical lines (default)
+      prompt="x"   → frame delimiter = exact prompt match (for gdb etc.)
+    """
+    logpath = _log(session)
+    state = "ECHOING"
+    remaining = echo_count
+    output = []
+    deadline = time.monotonic() + timeout if timeout else None
+    repeat_count = 0
+    last_clean = None
+
+    with open(logpath, "r", errors="replace") as f:
+        f.seek(log_offset)
+        while True:
+            if deadline and time.monotonic() > deadline:
+                return {"cell_id": cell_id, "status": "timeout", "output": ""}
+
+            line = f.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+
+            clean = ANSI_RE.sub("", line).strip()
+            if not clean:
+                continue
+
+            if clean.startswith("── cell:") or clean.startswith("── notify "):
+                continue
+
+            if state == "ECHOING":
+                remaining -= 1
+                if remaining <= 0:
+                    state = "OUTPUT"
+
+            elif state == "OUTPUT":
+                if prompt:
+                    if clean == prompt:
+                        break
+                    if clean == "..." or clean.startswith("... "):
+                        continue
+                    output.append(clean)
+                else:
+                    if clean == "..." or clean.startswith("... "):
+                        last_clean = clean
+                        continue
+
+                    if clean == last_clean:
+                        repeat_count += 1
+                    else:
+                        repeat_count = 0
+
+                    output.append(clean)
+
+                    if repeat_count >= FRAME_ENTERS - 1:
+                        # frame delimiter — remove all prompt repeats from output
+                        for _ in range(repeat_count + 1):
+                            output.pop()
+                        break
+                last_clean = clean
+
+    result = {
+        "cell_id": cell_id,
+        "status": "done",
+        "output": "\n".join(output)
+    }
+
+    with open(_result(session, cell_id), "w") as f:
+        json.dump(result, f)
+    _log_event(session, f"── cell:{cell_id} done ──")
+
+    return result
+
+
+def _echo_count(code):
+    """Count how many lines the REPL will echo (= non-trailing-blank lines)."""
+    code_lines = code.lstrip().split("\n")
+    count = len(code_lines)
+    while count > 0 and not code_lines[count - 1].strip():
+        count -= 1
+    return count
+
+
+def _send_code(session, code, prompt=None):
+    """Send code via paste-buffer (no per-char echo) + frame enters."""
+    code_lines = code.lstrip().split("\n")
+
+    # paste-buffer: entire text arrives as one write → readline redraws once
+    text = "\n".join(code_lines) + "\n"
+    subprocess.run([TMUX, "load-buffer", "-"], input=text.encode(), check=True)
+    subprocess.run([TMUX, "paste-buffer", "-d", "-t", session], check=True)
+
+    if not prompt:
+        # frame enters still via send-keys (empty Enters, no echo issue)
+        args = [TMUX, "send-keys", "-t", session]
+        for _ in range(FRAME_ENTERS):
+            args.extend(["", "Enter"])
+        subprocess.run(args, check=True)
+
+
+# ═══════════════════════════════════════════
+# COMMANDS
+# ═══════════════════════════════════════════
+
+def cmd_new(session, cmd_parts, prompt=None):
+    if T.has(session):
+        print(f"OK {session} (alive)")
+        return 0
+    cmd = " ".join(cmd_parts) if cmd_parts else "bash"
+    _create(session, cmd, prompt)
+    if prompt:
+        print(f"OK {session} prompt={repr(prompt)}")
+    else:
+        print(f"OK {session}")
+    return 0
+
+
+def cmd_fire(session, code, timeout=300):
+    if not _session_exists(session):
+        _json({"status": "error", "output": f"no session '{session}'"}); return 1
+
+    cell_id = uuid.uuid4().hex[:12]
+    prompt = _session_prompt(session)
+    _ensure_pipe(session)
+    echo_count = _echo_count(code)
+
+    # lock BEFORE sending — rejected fire must not touch the REPL
+    log_offset = _log_size(session)
+    held = _acquire(session, cell_id, log_offset, echo_count)
+    if held:
+        _json({"status": "error", "output": f"active cell '{held}'"}); return 1
+
+    _send_code(session, code, prompt)
+    _log_event(session, f"── cell:{cell_id} fired ──")
+
+    bg_args = [sys.executable, os.path.abspath(__file__), "_bg",
+               session, cell_id, str(log_offset), str(echo_count), str(timeout)]
+    if prompt:
+        bg_args.append(prompt)
+
+    bg = subprocess.Popen(bg_args, start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # store bg PID in lock for orphan detection
+    try:
+        with open(_lock(session), "r+") as f:
+            meta = json.load(f)
+            meta["bg_pid"] = bg.pid
+            f.seek(0); f.truncate()
+            json.dump(meta, f)
+    except: pass
+
+    _json({"cell_id": cell_id, "status": "fired"})
+    return 0
+
+
+def cmd_poll(session, cell_id=None):
+    if cell_id is None:
+        meta = _load_cell(session)
+        if not meta:
+            _json({"status": "error", "output": f"no active cell on '{session}'."}); return 1
+        cell_id = meta["cell_id"]
+
+    rpath = _result(session, cell_id)
+    if os.path.exists(rpath):
+        try:
+            with open(rpath) as f: result = json.load(f)
+            os.unlink(rpath)
+            _release(session, cell_id)
+            _json(result)
+            return 0
+        except: pass
+
+    # check if bg process died (orphaned lock)
+    meta = _load_cell(session)
+    if meta and "bg_pid" in meta:
+        pid = meta["bg_pid"]
+        alive = False
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                alive = b"_bg" in f.read()  # still running our watcher
+        except (FileNotFoundError, PermissionError):
+            alive = False
+        if not alive:
+            _release(session, cell_id)
+            _json({"cell_id": cell_id, "status": "error", "output": "watcher died"})
+            return 1
+
+    _json({"cell_id": cell_id, "status": "running"})
+    return 0
+
+
+def cmd_run(session, code, timeout=30, json_out=False):
+    if not _session_exists(session):
+        if json_out: _json({"status": "error", "output": f"no session '{session}'"})
+        else: print(f"ERR no session '{session}'")
+        return 1
+
+    prompt = _session_prompt(session)
+    _ensure_pipe(session)
+    cell_id = uuid.uuid4().hex[:12]
+    echo_count = _echo_count(code)
+
+    # lock BEFORE sending — rejected run must not touch the REPL
+    log_offset = _log_size(session)
+    held = _acquire(session, cell_id, log_offset, echo_count)
+    if held:
+        if json_out: _json({"status": "error", "output": f"active cell '{held}'"})
+        else: print(f"ERR active cell '{held}'")
+        return 1
+
+    _send_code(session, code, prompt)
+    result = _stream_process(session, cell_id, log_offset, echo_count, timeout, prompt)
+    _release(session, cell_id)
+
+    if json_out: _json(result)
+    else: print(result.get("output", ""))
+    return 0
+
+
+def cmd_notify(session, message):
+    if not _session_exists(session):
+        print(f"ERR no session '{session}'"); return 1
+    try: parent = open(f"/proc/{os.getppid()}/comm").read().strip()
+    except: parent = "?"
+    _log_event(session, f"── notify [{parent}@k:{os.getpid()}] {message} ──")
+    print(f"OK notified: {message}")
+    return 0
+
+
+def cmd_int(s):
+    T.send_int(s)
+    time.sleep(0.3)
+    # re-send frame enters (SIGINT clears readline's typeahead buffer)
+    args = [TMUX, "send-keys", "-t", s]
+    for _ in range(FRAME_ENTERS):
+        args.extend(["", "Enter"])
+    subprocess.run(args, check=True)
+    print("OK"); return 0
+
+def cmd_kill(s):
+    T.pipe_stop(s); T.kill(s)
+    d = os.path.join(CELL_DIR, s)
+    if os.path.isdir(d): shutil.rmtree(d, ignore_errors=True)
+    print(f"OK killed {s}"); return 0
+
+def cmd_ls():
+    s = T.ls(); print(s if s else "no sessions"); return 0
+
+def cmd_status(session):
+    if not _session_exists(session): print(f"ERR no session '{session}'"); return 1
+    logpath = _log(session)
+    pipe_ok = False
+    if os.path.exists(logpath):
+        before = os.path.getsize(logpath)
+        subprocess.run([TMUX, "send-keys", "-t", session, " ", "BSpace"], capture_output=True)
+        time.sleep(0.2)
+        pipe_ok = (os.path.getsize(logpath) > before)
+    if not pipe_ok:
+        T.pipe_start(session, logpath)
+        print(f"OK {session} pipe=repaired")
+    else:
+        print(f"OK {session} pipe=ok")
+    return 0
+
+
+# ═══════════════════════════════════════════
+# WATCH / HISTORY
+# ═══════════════════════════════════════════
+
+_NOTIFY_RE = re.compile(r"^── notify \[(.+?)\] (.+) ──$")
+_CELL_RE = re.compile(r"^── cell:([0-9a-f]{12}) (fired|done) ──$")
+
+def _filter_line(raw_line):
+    clean = ANSI_RE.sub("", raw_line).strip()
+    if not clean: return None
+    m = _NOTIFY_RE.match(clean)
+    if m: return f"\033[33m📢 {m.group(2)}\033[0m \033[2m({m.group(1)})\033[0m"
+    m = _CELL_RE.match(clean)
+    if m:
+        if m.group(2) == "fired": return f"\033[2;36m── {m.group(1)[:8]} ──\033[0m"
+        else: return f"\033[2;32m── ✓ ──\033[0m"
+    if clean == "..." or clean.startswith("... "): return None
+    return ANSI_RE.sub("", raw_line).rstrip()
+
+def cmd_watch(session):
+    if not _session_exists(session): print(f"ERR no session '{session}'"); return 1
+    logpath = _log(session)
+    if not os.path.exists(logpath): print(f"ERR no log"); return 1
+    print(f"\033[2mwatching {session} (ctrl-c to stop)\033[0m\n")
+    try:
+        proc = subprocess.Popen(["tail", "-n", "0", "-f", logpath], stdout=subprocess.PIPE, text=True)
+        last_printed = None
+        for raw_line in proc.stdout:
+            r = _filter_line(raw_line)
+            if r is not None and r != last_printed:
+                print(r)
+                last_printed = r
+    except KeyboardInterrupt: print(f"\n\033[2mstopped\033[0m")
+    finally:
+        if proc.poll() is None: proc.kill(); proc.wait()
+    return 0
+
+def cmd_history(session, n=5):
+    if not _session_exists(session): print(f"ERR no session '{session}'"); return 1
+    logpath = _log(session)
+    if not os.path.exists(logpath): print(f"ERR no log"); return 1
+    with open(logpath, "r", errors="replace") as f: raw_lines = f.readlines()
+    filtered = [r for line in raw_lines if (r := _filter_line(line)) is not None]
+    # dedup consecutive identical lines (frame delimiter noise)
+    deduped = []
+    for line in filtered:
+        if not deduped or line.strip() != deduped[-1].strip():
+            deduped.append(line)
+    for line in deduped[-n * 5:]: print(line)
+    return 0
+
+
+# ═══════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════
+
+def main():
+    args = sys.argv[1:]
+    if not args: print(__doc__.strip()); return 0
+    verb, rest = args[0], args[1:]
+
+    if verb == "_bg" and len(rest) >= 5:
+        session, cell_id, offset, echo, tout = rest[:5]
+        prompt = rest[5] if len(rest) > 5 else None
+        _stream_process(session, cell_id, int(offset), int(echo), timeout=int(tout), prompt=prompt)
+        return 0
+
+    if verb == "new" and rest:
+        prompt = None; cmd_parts = []
+        for a in rest[1:]:
+            if a.startswith("--prompt="): prompt = a[len("--prompt="):]
+            else: cmd_parts.append(a)
+        return cmd_new(rest[0], cmd_parts, prompt)
+    if verb == "kill" and rest: return cmd_kill(rest[0])
+    if verb == "ls": return cmd_ls()
+
+    if verb in ("run", "await"):
+        timeout, json_out = 30, False
+        while rest and rest[0].startswith("-"):
+            if rest[0] == "-t" and len(rest) >= 2: timeout = int(rest[1]); rest = rest[2:]
+            elif rest[0] == "-j": json_out = True; rest = rest[1:]
+            else: break
+        if len(rest) >= 2: s, c = rest[0], rest[1]
+        elif len(rest) == 1: s, c = _resolve(), rest[0]
+        else: print("usage: k run [-j] [-t N] [session] <code>"); return 1
+        if not s: print("ERR: no session found."); return 1
+        return cmd_run(s, c, timeout, json_out)
+
+    if verb == "fire" and rest:
+        timeout = 300
+        while rest and rest[0].startswith("-"):
+            if rest[0] == "-t" and len(rest) >= 2: timeout = int(rest[1]); rest = rest[2:]
+            else: break
+        s, c = (rest[0], rest[1]) if len(rest) >= 2 else (_resolve(), rest[0])
+        if not s: print("ERR: no session found."); return 1
+        return cmd_fire(s, c, timeout)
+
+    if verb == "poll":
+        s = _resolve(rest[0] if rest else None)
+        if not s: print("ERR: no session found."); return 1
+        return cmd_poll(s, rest[1] if len(rest) >= 2 else None)
+
+    if verb == "notify" and rest:
+        if len(rest) >= 2 and T.has(rest[0]): s, msg = rest[0], " ".join(rest[1:])
+        else: s, msg = _resolve(), " ".join(rest)
+        if not s: print("ERR: no session found."); return 1
+        return cmd_notify(s, msg)
+
+    if verb == "int":
+        s = _resolve(rest[0] if rest else None)
+        if not s: print("ERR: no session found."); return 1
+        return cmd_int(s)
+    if verb == "status":
+        s = _resolve(rest[0] if rest else None)
+        if not s: print("ERR: no session found."); return 1
+        return cmd_status(s)
+    if verb == "watch":
+        s = _resolve(rest[0] if rest else None)
+        if not s: print("ERR: no session found."); return 1
+        return cmd_watch(s)
+    if verb == "history":
+        n = 5
+        if rest and rest[0] == "-n" and len(rest) >= 2: n = int(rest[1]); rest = rest[2:]
+        s = _resolve(rest[0] if rest else None)
+        if not s: print("ERR: no session found."); return 1
+        return cmd_history(s, n)
+
+    print(__doc__.strip()); return 1
+
+if __name__ == "__main__": sys.exit(main())

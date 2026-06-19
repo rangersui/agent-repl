@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 r"""
-km — interrupt-driven monitor for k sessions.
+km -- interrupt-driven monitor for k sessions.
 
 Watches a tmux session via pipe-pane (not polling).
 Outputs structured JSON events to stdout.
-Each stdout line → one Monitor notification → agent interrupt.
+Each stdout line -> one Monitor notification -> agent interrupt.
 
 Usage:
   km <session> [cell_id] [-1]
@@ -14,12 +14,12 @@ Usage:
   -1         exit after first completion (one-shot / .then())
 
 Examples:
-  km work abc123 -1          ← await one cell
-  km work -1                 ← await any cell completion
-  km work                    ← continuous, all completions
+  km work abc123 -1          <- await one cell
+  km work -1                 <- await any cell completion
+  km work                    <- continuous, all completions
 
 Architecture:
-  tmux pipe-pane → log file → tail -f → parse → JSON event → stdout
+  tmux pipe-pane -> log file -> tail -f -> parse -> JSON event -> stdout
   No polling. Interrupt-driven end to end.
   This is the .then() callback mechanism.
 """

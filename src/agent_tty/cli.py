@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-tty / k — persistent terminal sessions for AI agents
+agent-tty / k -- persistent terminal sessions for AI agents
 
 Usage:
   k new    <session> [cmd...] [--prompt="x"]  spawn session (default: bash)
@@ -15,14 +15,14 @@ Usage:
   k ls                                        list sessions
   k status [session]                          health check
   k watch  [session]                          live filtered view
-  k history [-n N] [session]                  last N×5 lines (default 5)
+  k history [-n N] [session]                  last N*5 lines (default 5)
 
-Session resolves: explicit arg → K_SESSION env → auto-detect.
+Session resolves: explicit arg > K_SESSION env > auto-detect.
 
 Frame detection (--prompt):
-  not set      → 5 empty Enters, detect repeated prompt lines (zero config)
-  "string"     → exact prompt match (e.g. --prompt="(gdb)")
-  ./file       → stdin hook: k feeds lines, hook exit = frame end
+  not set      -> 5 empty Enters, detect repeated prompt lines (zero config)
+  "string"     -> exact prompt match (e.g. --prompt="(gdb)")
+  ./file       -> stdin hook: k feeds lines, hook exit = frame end
                hook path canonicalised to absolute at k new time; must exist and be executable
 
 JSON output (-j / fire / poll):
@@ -41,7 +41,7 @@ Timeout: lock is NOT released (command may still be running).
   Only k int or k kill releases. k int sends ctrl-c, writes interrupted, releases lock.
 
 Monitor (separate command):
-  km <session> [cell_id] [-1]    event stream — each stdout line is one JSON event
+  km <session> [cell_id] [-1]    event stream -- each stdout line is one JSON event
                                  -1 = exit after first completion (one-shot)
   Events: fired, done, notify, closed, error (all include "ts" field)
 """

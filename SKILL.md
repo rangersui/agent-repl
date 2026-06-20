@@ -228,6 +228,8 @@ def factorial(n):
 
 The rule: if the code has `"` or `'` or `\` or `$` inside string literals, write it to a file and load through k. Do not try to hand-escape complex code inline — the quoting layers (shell → k → tmux → REPL) will fight you.
 
+Bash multiline is handled automatically — k writes a cell-id-named script and sources it. For Python and other REPLs, use a unique path (e.g. `/tmp/k_task_<descriptive>_<nonce>.py`) to avoid collisions when multiple agents or sessions are active.
+
 ## Language Notes
 
 k is REPL-agnostic. Any program with a readline prompt works:

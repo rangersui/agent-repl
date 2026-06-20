@@ -31,8 +31,12 @@ def max_runtime_checks() -> int:
 
 
 expected_checks = max_runtime_checks()
-project_version = re.search(r'^version = "([^"]+)"$', PYPROJECT, flags=re.M).group(1)
-init_version = re.search(r'^__version__ = "([^"]+)"$', INIT, flags=re.M).group(1)
+project_version_match = re.search(r'^version = "([^"]+)"$', PYPROJECT, flags=re.M)
+init_version_match = re.search(r'^__version__ = "([^"]+)"$', INIT, flags=re.M)
+check("pyproject: version exists", project_version_match is not None)
+check("__init__: version exists", init_version_match is not None)
+project_version = project_version_match.group(1) if project_version_match else ""
+init_version = init_version_match.group(1) if init_version_match else ""
 cli_commands = sorted(set(re.findall(r'^\s*k\s+([a-z]+)\b', K_HELP, flags=re.M)))
 DOCS = (("README.md", README), ("SKILL.md", SKILL), ("man/agent-tty.1", MAN))
 USER_DOCS = (("SKILL.md", SKILL), ("docs/index.html", HTML), ("man/agent-tty.1", MAN))
@@ -163,6 +167,7 @@ for os_name in ("ubuntu-latest", "macos-latest", "windows-latest"):
 for action in ("actions/checkout@v6", "actions/setup-python@v6"):
     check(f"CI: uses {action}", action in CI)
 for needle in (
+    "python -m mypy src vendor tests",
     "python tests/test_contracts.py",
     "python tests/test_bridge_contracts.py",
     "python tests/test_docs.py",

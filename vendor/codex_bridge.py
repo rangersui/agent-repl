@@ -141,7 +141,7 @@ class ThreadRuntimeStatus:
     active_flags: tuple[str, ...] = ()
 
     @classmethod
-    def parse(cls, raw: Any) -> "ThreadRuntimeStatus":
+    def parse(cls: type["ThreadRuntimeStatus"], raw: Any) -> "ThreadRuntimeStatus":
         if not isinstance(raw, dict):
             raise BridgeError(f"invalid thread status: {raw!r}")
         kind = raw.get("type")
@@ -198,7 +198,7 @@ class PollResult:
     error: str | None = None
 
     @classmethod
-    def from_completed_process(cls, proc: subprocess.CompletedProcess[str]) -> "PollResult":
+    def from_completed_process(cls: type["PollResult"], proc: subprocess.CompletedProcess[str]) -> "PollResult":
         stdout = proc.stdout.strip()
         stderr = proc.stderr.strip()
         if proc.returncode != 0:
@@ -226,7 +226,7 @@ class KmEvent:
     cell_id: str | None = None
 
     @classmethod
-    def parse(cls, line: str) -> "KmEvent | None":
+    def parse(cls: type["KmEvent"], line: str) -> "KmEvent | None":
         try:
             raw = json.loads(line)
         except json.JSONDecodeError:
@@ -256,7 +256,7 @@ class EventPrompt:
     text: str
 
     @classmethod
-    def from_event(cls, event: KmEvent, poll: PollResult | None, max_output_chars: int) -> "EventPrompt":
+    def from_event(cls: type["EventPrompt"], event: KmEvent, poll: PollResult | None, max_output_chars: int) -> "EventPrompt":
         cell_hint = f" cell={event.cell_id}" if event.cell_id else ""
         lines = [
             "agent-tty km event arrived.",
@@ -277,7 +277,7 @@ class EventPrompt:
         return cls("\n".join(lines))
 
     @classmethod
-    def batch(cls, prompts: list["EventPrompt"]) -> "EventPrompt":
+    def batch(cls: type["EventPrompt"], prompts: list["EventPrompt"]) -> "EventPrompt":
         if not prompts:
             raise BridgeError("cannot start a turn without an event prompt")
         if len(prompts) == 1:
@@ -411,7 +411,7 @@ class InitializedCodex:
         self._rpc = rpc
 
     @classmethod
-    def connect(cls, codex_bin: str) -> "InitializedCodex":
+    def connect(cls: type["InitializedCodex"], codex_bin: str) -> "InitializedCodex":
         rpc = _CodexRpc(codex_bin)
         try:
             rpc.request(
@@ -631,8 +631,8 @@ def run_bridge(args: argparse.Namespace) -> int:
             print(json.dumps({"data": codex.list_loaded_thread_ids()}, ensure_ascii=False, indent=2))
             return 0
         if args.list_threads:
-            for thread in codex.list_threads(args.thread_search, args.thread_search_limit, args.thread_cwd):
-                print(_format_thread_summary(thread))
+            for summary in codex.list_threads(args.thread_search, args.thread_search_limit, args.thread_cwd):
+                print(_format_thread_summary(summary))
             return 0
 
         thread = choose_thread(codex, args.thread_selector)

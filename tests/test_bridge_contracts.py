@@ -3,6 +3,7 @@
 
 import ast
 from pathlib import Path
+from typing import Any, cast
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +62,8 @@ def segment(src: str, node: ast.AST | None) -> str:
     if node is None:
         return ""
     lines = src.splitlines()
-    return "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    positioned = cast(Any, node)
+    return "\n".join(lines[positioned.lineno - 1 : positioned.end_lineno])
 
 
 def check_no_except_pass(name: str, tree: ast.Module) -> None:
@@ -70,8 +72,25 @@ def check_no_except_pass(name: str, tree: ast.Module) -> None:
             FAILURES.append(f"{name}:{node.lineno}: except handler must not pass silently")
 
 
+def check_function_annotations(label: str, tree: ast.Module) -> None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        args = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+        if node.args.vararg is not None:
+            args.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            args.append(node.args.kwarg)
+        missing = [arg.arg for arg in args if arg.arg != "self" and arg.annotation is None]
+        if missing:
+            FAILURES.append(f"{label}:{node.lineno}: missing arg annotations on {node.name}: {', '.join(missing)}")
+        if node.returns is None:
+            FAILURES.append(f"{label}:{node.lineno}: missing return annotation on {node.name}")
+
+
 TREE = parse(BRIDGE_PATH, BRIDGE_SRC)
 check_no_except_pass("vendor/codex_bridge.py", TREE)
+check_function_annotations("vendor/codex_bridge.py", TREE)
 
 raw_rpc_cls = klass(TREE, "_CodexRpc")
 codex_cls = klass(TREE, "InitializedCodex")
@@ -172,7 +191,7 @@ check("KmEvent.parse: validates status", "FORWARDABLE_STATUSES" in km_event_seg)
 check("KmEvent.parse: validates session", "SAFE_SESSION_RE.match(session)" in km_event_seg)
 check("KmEvent.parse: validates cell id", "CELL_ID_RE.match(cell_id)" in km_event_seg)
 check("KmEvent: pollable status gate", "POLLABLE_STATUSES" in km_event_seg and "should_poll" in km_event_seg)
-check("EventPrompt: only built from KmEvent", "def from_event(cls, event: KmEvent" in event_prompt_seg)
+check("EventPrompt: only built from KmEvent", "event: KmEvent" in event_prompt_seg)
 check("EventPrompt: includes poll output", "_format_poll_result" in event_prompt_seg and "Cell output" in format_poll_seg)
 check("EventPrompt: emits visible turn input", "def to_turn_input" in event_prompt_seg and '"type": "text"' in event_prompt_seg)
 check("EventPrompt: batches queued events", "def batch" in event_prompt_seg and "Multiple agent-tty events" in event_prompt_seg)

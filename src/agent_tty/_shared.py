@@ -12,7 +12,10 @@ Anti-pattern this prevents:
   → km -1 hangs forever (silent protocol drift)
 """
 
+from __future__ import annotations
+
 import os, re, shlex, shutil, subprocess, sys
+from typing import IO, Any
 
 if os.name != "posix":
     print("ERR agent-tty requires POSIX: tmux + tail + POSIX signals", file=sys.stderr)
@@ -31,13 +34,13 @@ def _require_executable(name: str, hint: str) -> str:
 TMUX = _require_executable("tmux", "install tmux and retry")
 TAIL = _require_executable("tail", "install coreutils or make tail available in PATH")
 
-def _tmux_version_tuple(version_text: str):
+def _tmux_version_tuple(version_text: str) -> tuple[int, int] | None:
     m = re.search(r"\btmux\s+([0-9]+)(?:\.([0-9]+))?", version_text)
     if not m:
         return None
     return int(m.group(1)), int(m.group(2) or 0)
 
-def _require_tmux_version(min_version=(3, 0)):
+def _require_tmux_version(min_version: tuple[int, int] = (3, 0)) -> None:
     try:
         proc = subprocess.run([TMUX, "-V"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as e:
@@ -128,13 +131,13 @@ NOTIFY_EVENT_RE = re.compile(r"^── notify \[(.+?)\] (.*) ──$")
 _SAFE_NAME = re.compile(r'^[A-Za-z0-9_.-]+$')
 CELL_ID_RE = re.compile(r'^[0-9a-f]{12}$')
 
-def validate_name(name: str, prefix: str = "ERR"):
+def validate_name(name: str, prefix: str = "ERR") -> None:
     """Reject path traversal / injection. Exits on invalid — protocol-level rejection."""
     if not name or name == "." or not _SAFE_NAME.match(name) or '..' in name:
         print(f"{prefix} invalid session name: {name!r}", file=sys.stderr)
         sys.exit(1)
 
-def open_private(path: str, flags: int, mode: str = "r", **kwargs):
+def open_private(path: str, flags: int, mode: str = "r", **kwargs: Any) -> IO[Any]:
     """Open a private 0600 file without following symlinks where supported."""
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW

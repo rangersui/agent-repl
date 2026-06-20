@@ -48,7 +48,11 @@ Monitor (separate command):
                                  -1 = exit after first completion (one-shot)
   Events: fired, done, timeout, interrupted, notify, closed, error (all include "ts" field)
 """
+from __future__ import annotations
+
 import json, os, re, shlex, signal, shutil, subprocess, sys, time, uuid
+from types import TracebackType
+from typing import Any, IO
 
 # ensure package importable when run as standalone script (_bg subprocess)
 _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +81,9 @@ from agent_tty._shared import (  # noqa: E402
 
 import fcntl  # noqa: E402
 
+JsonMap = dict[str, Any]
+CellMeta = dict[str, Any]
+
 
 # ═══════════════════════════════════════════
 # TMUX
@@ -84,36 +91,36 @@ import fcntl  # noqa: E402
 
 class T:
     @staticmethod
-    def spawn(s, cmd):
+    def spawn(s: str, cmd: str | None) -> None:
         subprocess.run([TMUX, "new-session", "-d", "-s", s, "-x", "10000", "-y", "50"]
                        + ([cmd] if cmd else []), check=True)
     @staticmethod
-    def has(s):
+    def has(s: str) -> bool:
         return subprocess.run([TMUX, "has-session", "-t", s], capture_output=True).returncode == 0
     @staticmethod
-    def kill(s):
+    def kill(s: str) -> None:
         subprocess.run([TMUX, "kill-session", "-t", s], capture_output=True)
     @staticmethod
-    def send(s, text):
+    def send(s: str, text: str) -> None:
         subprocess.run([TMUX, "send-keys", "-t", s, text, "Enter"], check=True)
     @staticmethod
-    def send_enter(s):
+    def send_enter(s: str) -> None:
         subprocess.run([TMUX, "send-keys", "-t", s, "", "Enter"], check=True)
     @staticmethod
-    def send_int(s):
+    def send_int(s: str) -> None:
         subprocess.run([TMUX, "send-keys", "-t", s, "C-c"], check=True)
     @staticmethod
-    def ls():
+    def ls() -> str:
         r = subprocess.run([TMUX, "list-sessions", "-F", "#{session_name}"],
                            capture_output=True, text=True)
         return r.stdout.strip()
     @staticmethod
-    def pipe_start(s, logfile):
+    def pipe_start(s: str, logfile: str) -> None:
         with _open_private(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a"):
             pass
         subprocess.run([TMUX, "pipe-pane", "-t", s, f"cat >> {shlex.quote(logfile)}"], check=True)
     @staticmethod
-    def pipe_stop(s):
+    def pipe_stop(s: str) -> None:
         subprocess.run([TMUX, "pipe-pane", "-t", s], capture_output=True)
 
 
@@ -121,15 +128,15 @@ class T:
 # PATHS + HELPERS
 # ═══════════════════════════════════════════
 
-def _session_dir(s):
+def _session_dir(s: str) -> str:
     validate_name(s)
     return ensure_private_dir(os.path.join(CELL_DIR, s))
 
-def _meta(s):   return os.path.join(_session_dir(s), "_session.json")
-def _lock(s):   return os.path.join(_session_dir(s), "_lock.json")
-def _lock_guard_path(s): return os.path.join(_session_dir(s), "_lock.guard")
-def _log(s):    return os.path.join(_session_dir(s), "_output.log")
-def _result(s, cid): return os.path.join(_session_dir(s), f"{validate_cell_id(cid)}_result.json")
+def _meta(s: str) -> str:   return os.path.join(_session_dir(s), "_session.json")
+def _lock(s: str) -> str:   return os.path.join(_session_dir(s), "_lock.json")
+def _lock_guard_path(s: str) -> str: return os.path.join(_session_dir(s), "_lock.guard")
+def _log(s: str) -> str:    return os.path.join(_session_dir(s), "_output.log")
+def _result(s: str, cid: str) -> str: return os.path.join(_session_dir(s), f"{validate_cell_id(cid)}_result.json")
 
 class LockBusy(Exception):
     """Raised when a non-blocking LockGuard cannot acquire the mutex."""
@@ -137,13 +144,13 @@ class LockBusy(Exception):
 
 class LockGuard:
     """Proof token: caller holds the per-session lock-file mutex."""
-    def __init__(self, session, blocking=True):
+    def __init__(self, session: str, blocking: bool = True) -> None:
         validate_name(session)
         self.session = session
         self.blocking = blocking
-        self._f = None
+        self._f: IO[Any] | None = None
 
-    def __enter__(self):
+    def __enter__(self) -> "LockGuard":
         self._f = _open_private(_lock_guard_path(self.session),
                                 os.O_RDWR | os.O_CREAT, "r+")
         flags = fcntl.LOCK_EX
@@ -157,32 +164,37 @@ class LockGuard:
             raise LockBusy
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         if self._f is None:
-            return False
+            return
         try:
             fcntl.flock(self._f.fileno(), fcntl.LOCK_UN)
         finally:
             self._f.close()
-        return False
+        return
 
-def _log_size(s):
+def _log_size(s: str) -> int:
     try: return os.path.getsize(_log(s))
     except FileNotFoundError: return 0
 
-def _ensure_pipe(s):
+def _ensure_pipe(s: str) -> None:
     """(Re)start pipe-pane. Idempotent — replaces dead/existing pipe."""
     logpath = _log(s)
     T.pipe_start(s, logpath)
 
-def _log_event(s, event):
+def _log_event(s: str, event: str) -> None:
     try:
         with _open_private(_log(s), os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a") as f:
             f.write(f"\n{event}\n")
     except OSError as e:
         print(f"WARN log event failed for {s}: {e}", file=sys.stderr)
 
-def _resolve(explicit=None):
+def _resolve(explicit: str | None = None) -> str | None:
     if explicit:
         validate_name(explicit)
         return explicit
@@ -197,25 +209,25 @@ def _resolve(explicit=None):
             return ss[0]
     return None
 
-def _json(d): print(json.dumps(d, ensure_ascii=False))
+def _json(d: JsonMap) -> None: print(json.dumps(d, ensure_ascii=False))
 
-def _emit(json_out, data, text=None):
+def _emit(json_out: bool, data: JsonMap, text: str | None = None) -> None:
     """Unified output: JSON mode → _json(data), text mode → print(text)."""
     if json_out: _json(data)
     else: print(text if text is not None else data.get("output", ""))
 
-def _no_session_output(session=None):
+def _no_session_output(session: str | None = None) -> str:
     if session:
         return f"no session '{session}'; use k new {session} bash"
     return "no session found; use k ls or k new <session> bash"
 
-def _no_log_output(session):
+def _no_log_output(session: str) -> str:
     return f"no log for '{session}'; use k status {session}"
 
-def _warn(message):
+def _warn(message: str) -> None:
     print(f"WARN {message}", file=sys.stderr)
 
-def _parse_positive_int(raw, option, usage):
+def _parse_positive_int(raw: str, option: str, usage: str) -> int | None:
     try:
         value = int(raw)
     except ValueError:
@@ -228,11 +240,11 @@ def _parse_positive_int(raw, option, usage):
         return None
     return value
 
-def _watcher_pgid(meta):
+def _watcher_pgid(meta: CellMeta) -> Any:
     """Return watcher process group id."""
     return meta.get("bg_pgid")
 
-def _watcher_alive(meta):
+def _watcher_alive(meta: CellMeta) -> bool:
     pgid = _watcher_pgid(meta)
     if not pgid:
         return False
@@ -246,7 +258,7 @@ def _watcher_alive(meta):
     except OSError:
         return False
 
-def _kill_watcher(meta):
+def _kill_watcher(meta: CellMeta) -> bool:
     """Terminate bg watcher process group. Returns True when it is gone."""
     pgid = _watcher_pgid(meta)
     if not pgid:
@@ -279,7 +291,7 @@ def _kill_watcher(meta):
         time.sleep(0.05)
     return not _watcher_alive(meta)
 
-def _write_result(session, cell_id, result):
+def _write_result(session: str, cell_id: str, result: JsonMap) -> None:
     """Atomic result write: tmp + fsync + os.replace. No partial reads."""
     rpath = _result(session, cell_id)
     tmp = rpath + ".tmp"
@@ -289,7 +301,7 @@ def _write_result(session, cell_id, result):
         os.fsync(f.fileno())
     os.replace(tmp, rpath)
 
-def _update_lock(session, cell_id=None, *, blocking=True, **kw):
+def _update_lock(session: str, cell_id: str | None = None, *, blocking: bool = True, **kw: Any) -> bool:
     """Read-modify-write lock file via atomic tmp+replace.
     If cell_id given, verify it matches.
     Returns True on success, False on failure or cell_id mismatch."""
@@ -299,7 +311,7 @@ def _update_lock(session, cell_id=None, *, blocking=True, **kw):
     except LockBusy:
         return False
 
-def _update_lock_unlocked(session, cell_id=None, **kw):
+def _update_lock_unlocked(session: str, cell_id: str | None = None, **kw: Any) -> bool:
     lock = _lock(session)
     try:
         with _open_private(lock, os.O_RDONLY, "r") as f:
@@ -328,7 +340,7 @@ def _update_lock_unlocked(session, cell_id=None, **kw):
         _warn(f"lock write failed for {session}: {e}")
         return False
 
-def _terminal_fields(status):
+def _terminal_fields(status: str) -> JsonMap:
     if status == TIMEOUT:
         return {"timed_out": True, "terminal_status": TIMEOUT}
     if status == DONE:
@@ -336,15 +348,17 @@ def _terminal_fields(status):
     return {"terminal_status": status}
 
 
-def _mark_terminal(session, cell_id, status, *, blocking=True):
+def _mark_terminal(session: str, cell_id: str, status: str, *, blocking: bool = True) -> bool:
     """Record terminal state on the lock without deleting it."""
     return _update_lock(session, cell_id=cell_id, blocking=blocking,
                         **_terminal_fields(status))
 
 
-def _commit_terminal_result(session, cell_id, result, *, blocking=True):
+def _commit_terminal_result(session: str, cell_id: str, result: JsonMap, *, blocking: bool = True) -> bool:
     """Commit terminal state, result file, and event log under one lock proof."""
-    status = result.get("status")
+    status = result.get("status", "")
+    if not isinstance(status, str):
+        status = ""
     deadline = time.monotonic() + 0.25
     while True:
         try:
@@ -369,16 +383,16 @@ def _commit_terminal_result(session, cell_id, result, *, blocking=True):
 # SESSION
 # ═══════════════════════════════════════════
 
-def _create(session, cmd, prompt=None):
+def _create(session: str, cmd: str, prompt: str | None = None) -> None:
     spawned = False
-    created_dir = None
+    created_dir: str | None = None
     try:
         T.spawn(session, cmd)
         spawned = True
         created_dir = _session_dir(session)
         _ensure_pipe(session)
         time.sleep(1.0)
-        meta = {"name": session, "cmd": cmd}
+        meta: JsonMap = {"name": session, "cmd": cmd}
         if prompt:
             meta["prompt"] = prompt  # explicit prompt → exact match mode
         with _open_private(_meta(session), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "w") as f:
@@ -396,10 +410,10 @@ def _create(session, cmd, prompt=None):
                 _warn(f"create rollback failed to remove {created_dir}: {e}")
         raise
 
-def _session_exists(session):
+def _session_exists(session: str) -> bool:
     return T.has(session) and os.path.exists(_meta(session))
 
-def _session_prompt(session):
+def _session_prompt(session: str) -> str | None:
     """Returns explicit prompt if set, None for default repeat-detection."""
     try:
         with _open_private(_meta(session), os.O_RDONLY, "r") as f: return json.load(f).get("prompt")
@@ -407,7 +421,7 @@ def _session_prompt(session):
         _warn(f"session metadata prompt read failed for {session}: {e}")
         return None
 
-def _session_cmd(session):
+def _session_cmd(session: str) -> str | None:
     try:
         with _open_private(_meta(session), os.O_RDONLY, "r") as f:
             return json.load(f).get("cmd")
@@ -420,14 +434,14 @@ def _session_cmd(session):
 # LOCK = CELL METADATA
 # ═══════════════════════════════════════════
 
-def _acquire(session, cell_id, log_offset, echo_count):
+def _acquire(session: str, cell_id: str, log_offset: int, echo_count: int) -> str | None:
     validate_cell_id(cell_id)
     with LockGuard(session):
         return _acquire_unlocked(session, cell_id, log_offset, echo_count)
 
-def _acquire_unlocked(session, cell_id, log_offset, echo_count):
+def _acquire_unlocked(session: str, cell_id: str, log_offset: int, echo_count: int) -> str | None:
     lock = _lock(session)
-    meta = {"cell_id": cell_id, "log_offset": log_offset, "echo_count": echo_count}
+    meta: JsonMap = {"cell_id": cell_id, "log_offset": log_offset, "echo_count": echo_count}
     for _ in range(2):
         try:
             with _open_private(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "w") as f:
@@ -449,7 +463,7 @@ def _acquire_unlocked(session, cell_id, log_offset, echo_count):
             return held_id
     return "?"
 
-def _load_cell(session):
+def _load_cell(session: str) -> CellMeta | None:
     try:
         with _open_private(_lock(session), os.O_RDONLY, "r") as f: meta = json.load(f)
     except FileNotFoundError:
@@ -465,11 +479,11 @@ def _load_cell(session):
         return None
     return meta
 
-def _release(session, cell_id):
+def _release(session: str, cell_id: str) -> bool:
     with LockGuard(session):
         return _release_unlocked(session, cell_id)
 
-def _release_if_current(session, cell_id):
+def _release_if_current(session: str, cell_id: str) -> bool:
     """Release only if the active lock still belongs to cell_id.
 
     Explicit polling of an old result must not fail just because a newer cell
@@ -488,7 +502,7 @@ def _release_if_current(session, cell_id):
             return True
         return _release_unlocked(session, cell_id)
 
-def _release_unlocked(session, cell_id):
+def _release_unlocked(session: str, cell_id: str) -> bool:
     try:
         lock = _lock(session)
         with _open_private(lock, os.O_RDONLY, "r") as f:
@@ -505,7 +519,7 @@ def _release_unlocked(session, cell_id):
         return False
 
 
-def _send_interrupt(session):
+def _send_interrupt(session: str) -> bool:
     """Send Ctrl-C to REPL + re-send frame enters in repeat mode.
     Returns True if Ctrl-C was delivered (or session is already dead).
     Returns False if Ctrl-C failed but session is still alive — caller must not release.
@@ -532,7 +546,7 @@ def _send_interrupt(session):
 
 class CellBusy(Exception):
     """Raised by CellLock when the session already has an active cell."""
-    def __init__(self, held_id):
+    def __init__(self, held_id: str) -> None:
         self.held_id = held_id
 
 
@@ -542,7 +556,7 @@ class CellLock:
       post-send (sent)    → interrupt recovery on exception, release on normal exit
       keep (timeout/fire) → lock stays held, no cleanup
     """
-    def __init__(self, session, cell_id, log_offset, echo_count):
+    def __init__(self, session: str, cell_id: str, log_offset: int, echo_count: int) -> None:
         self.session = session
         self.cell_id = cell_id
         self.log_offset = log_offset
@@ -552,30 +566,35 @@ class CellLock:
         self.interrupt_failed = False
         self.acquired = False
 
-    def __enter__(self):
+    def __enter__(self) -> "CellLock":
         held = _acquire(self.session, self.cell_id, self.log_offset, self.echo_count)
         if held:
             raise CellBusy(held)
         self.acquired = True
         return self
 
-    def mark_sent(self):
+    def mark_sent(self) -> None:
         self.sent = True
 
-    def mark_keep(self):
+    def mark_keep(self) -> None:
         self.keep = True
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         if not self.acquired:
-            return False
+            return
         if self.keep:
-            return False
+            return
         if exc_type is not None and self.sent:
             if not _send_interrupt(self.session):
                 # Ctrl-C didn't reach REPL but session is alive — keep lock
                 # (same reasoning as timeout: command may still be running)
                 self.interrupt_failed = True
-                return False
+                return
         _release(self.session, self.cell_id)
         # sync mode cleanup: remove result file (nobody will poll it)
         try:
@@ -584,7 +603,7 @@ class CellLock:
         except OSError as e:
             print(f"WARN result cleanup failed for {self.session}/{self.cell_id}: {e}", file=sys.stderr)
         _cleanup_input_script(self.session, self.cell_id)
-        return False
+        return
 
 
 # ═══════════════════════════════════════════
@@ -593,7 +612,14 @@ class CellLock:
 # (= REPL redrawing prompt on empty Enter)
 # ═══════════════════════════════════════════
 
-def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prompt=None):
+def _stream_process(
+    session: str,
+    cell_id: str,
+    log_offset: int,
+    echo_count: int,
+    timeout: int | None = None,
+    prompt: str | None = None,
+) -> JsonMap:
     """
     Stream processor with three modes:
       prompt=None      → frame = N consecutive identical lines (default)
@@ -601,15 +627,15 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
       prompt="./file"  → frame = hook process (stdin lines, exit=done)
     """
     logpath = _log(session)
-    state = "OUTPUT" if echo_count <= 0 else "ECHOING"
+    state: str = "OUTPUT" if echo_count <= 0 else "ECHOING"
     remaining = echo_count
-    output = []
+    output: list[str] = []
     deadline = time.monotonic() + timeout if timeout is not None else None
     repeat_count = 0
-    last_clean = None
+    last_clean: str | None = None
 
     # start hook process if prompt is an absolute file path (canonicalised by cmd_new)
-    hook = None
+    hook: subprocess.Popen[str] | None = None
     if prompt and os.path.isabs(prompt) and os.path.isfile(prompt):
         hook = subprocess.Popen(
             [prompt], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -654,6 +680,7 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
                     if hook:
                         # hook mode: feed line, exit = frame end
                         # NO filtering — hook user takes full control of output
+                        assert hook.stdin is not None
                         try:
                             hook.stdin.write(clean + "\n")
                             hook.stdin.flush()
@@ -703,7 +730,7 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
                 hook.kill()
             hook.wait()
 
-    result = {
+    result: JsonMap = {
         "cell_id": cell_id,
         "status": TIMEOUT if timed_out else DONE,
         "output": "" if timed_out else "\n".join(output)
@@ -716,7 +743,7 @@ def _stream_process(session, cell_id, log_offset, echo_count, timeout=None, prom
     return {"cell_id": cell_id, "status": ERROR, "output": "interrupted"}
 
 
-def _echo_count(code):
+def _echo_count(code: str) -> int:
     """Count how many lines the REPL will echo (= non-trailing-blank lines)."""
     code_lines = code.lstrip().split("\n")
     count = len(code_lines)
@@ -724,7 +751,7 @@ def _echo_count(code):
         count -= 1
     return count
 
-def _looks_like_bash(cmd):
+def _looks_like_bash(cmd: str | None) -> bool:
     if not cmd:
         return False
     try:
@@ -742,14 +769,14 @@ def _looks_like_bash(cmd):
         return False
     return os.path.basename(parts[i]) == "bash"
 
-def _has_multiple_code_lines(code):
+def _has_multiple_code_lines(code: str) -> bool:
     return _echo_count(code) > 1
 
-def _input_script(session, cell_id):
+def _input_script(session: str, cell_id: str) -> str:
     validate_cell_id(cell_id)
     return os.path.join(_session_dir(session), f"{cell_id}_input.sh")
 
-def _write_input_script(session, cell_id, code):
+def _write_input_script(session: str, cell_id: str, code: str) -> str:
     path = _input_script(session, cell_id)
     with _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "w") as f:
         f.write(code)
@@ -759,7 +786,7 @@ def _write_input_script(session, cell_id, code):
         os.fsync(f.fileno())
     return path
 
-def _cleanup_input_script(session, cell_id):
+def _cleanup_input_script(session: str, cell_id: str) -> None:
     try:
         os.unlink(_input_script(session, cell_id))
     except FileNotFoundError:
@@ -767,19 +794,19 @@ def _cleanup_input_script(session, cell_id):
     except OSError as e:
         print(f"WARN input script cleanup failed for {session}/{cell_id}: {e}", file=sys.stderr)
 
-def _should_source_bash(session, code, prompt):
+def _should_source_bash(session: str, code: str, prompt: str | None) -> bool:
     return (
         not prompt
         and _has_multiple_code_lines(code)
         and _looks_like_bash(_session_cmd(session))
     )
 
-def _source_command(session, cell_id):
+def _source_command(session: str, cell_id: str) -> str:
     script = _input_script(session, cell_id)
     return f"source {shlex.quote(script)}"
 
 
-def _send_frame_enters(session):
+def _send_frame_enters(session: str) -> None:
     """Send FRAME_ENTERS empty Enters via send-keys (repeat-mode framing)."""
     args = [TMUX, "send-keys", "-t", session]
     for _ in range(FRAME_ENTERS):
@@ -787,11 +814,11 @@ def _send_frame_enters(session):
     subprocess.run(args, check=True)
 
 
-def _is_hook_prompt(prompt):
+def _is_hook_prompt(prompt: str | None) -> bool:
     return bool(prompt and os.path.isabs(prompt) and os.path.isfile(prompt))
 
 
-def _send_code(session, code, prompt=None):
+def _send_code(session: str, code: str, prompt: str | None = None) -> None:
     """Send code via paste-buffer (no per-char echo) + frame enters."""
     code_lines = code.lstrip().split("\n")
 
@@ -809,7 +836,7 @@ def _send_code(session, code, prompt=None):
 # COMMANDS
 # ═══════════════════════════════════════════
 
-def cmd_new(session, cmd_parts, prompt=None):
+def cmd_new(session: str, cmd_parts: list[str], prompt: str | None = None) -> int:
     validate_name(session)
     if T.has(session):
         print(f"OK {session} (alive)")
@@ -836,7 +863,7 @@ def cmd_new(session, cmd_parts, prompt=None):
     return 0
 
 
-def cmd_fire(session, code, timeout=300):
+def cmd_fire(session: str, code: str, timeout: int = 300) -> int:
     if not _session_exists(session):
         _json({"status": ERROR, "output": _no_session_output(session)}); return 1
 
@@ -848,7 +875,7 @@ def cmd_fire(session, code, timeout=300):
     log_offset = _log_size(session)
 
     lock = CellLock(session, cell_id, log_offset, echo_count)
-    bg = None
+    bg: subprocess.Popen[Any] | None = None
     try:
         with lock:
             try:
@@ -893,7 +920,7 @@ def cmd_fire(session, code, timeout=300):
     return 0
 
 
-def cmd_poll(session, cell_id=None):
+def cmd_poll(session: str, cell_id: str | None = None) -> int:
     validate_name(session)
     if not _session_exists(session):
         _json({"status": ERROR, "output": _no_session_output(session)})
@@ -980,7 +1007,7 @@ def cmd_poll(session, cell_id=None):
     return 0
 
 
-def cmd_run(session, code, timeout=30, json_out=False):
+def cmd_run(session: str, code: str, timeout: int = 30, json_out: bool = False) -> int:
     if not _session_exists(session):
         _emit(json_out, {"status": ERROR, "output": _no_session_output(session)})
         return 1
@@ -1030,7 +1057,7 @@ def cmd_run(session, code, timeout=30, json_out=False):
     return 1 if result.get("status") == ERROR else 0
 
 
-def cmd_notify(session, message):
+def cmd_notify(session: str, message: str) -> int:
     if not _session_exists(session):
         print(f"ERR {_no_session_output(session)}"); return 1
     try:
@@ -1042,7 +1069,7 @@ def cmd_notify(session, message):
     return 0
 
 
-def cmd_int(s):
+def cmd_int(s: str) -> int:
     validate_name(s)
     if not _session_exists(s):
         print(f"ERR {_no_session_output(s)}"); return 1
@@ -1070,7 +1097,7 @@ def cmd_int(s):
             _cleanup_input_script(s, cell_id)
     print("OK"); return 0
 
-def cmd_kill(s):
+def cmd_kill(s: str) -> int:
     validate_name(s)
     # kill bg watcher if running
     meta = _load_cell(s)
@@ -1081,10 +1108,10 @@ def cmd_kill(s):
     if os.path.isdir(d): shutil.rmtree(d, ignore_errors=True)
     print(f"OK killed {s}"); return 0
 
-def cmd_ls():
+def cmd_ls() -> int:
     s = T.ls(); print(s if s else "no sessions"); return 0
 
-def cmd_status(session):
+def cmd_status(session: str) -> int:
     if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
     pipe_ok = False
@@ -1126,7 +1153,7 @@ def cmd_status(session):
 
 # CELL_EVENT_RE and NOTIFY_EVENT_RE imported from _shared (type-sealed)
 
-def _filter_line(raw_line):
+def _filter_line(raw_line: str) -> str | None:
     clean = ANSI_RE.sub("", raw_line).strip()
     if not clean: return None
     m = NOTIFY_EVENT_RE.match(clean)
@@ -1141,15 +1168,17 @@ def _filter_line(raw_line):
     if clean == "..." or clean.startswith("... "): return None
     return ANSI_RE.sub("", raw_line).rstrip()
 
-def cmd_watch(session):
+def cmd_watch(session: str) -> int:
     if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
     if not os.path.exists(logpath): print(f"ERR {_no_log_output(session)}"); return 1
     print(f"\033[2mwatching {session} (ctrl-c to stop)\033[0m\n")
+    proc: subprocess.Popen[str] | None
     proc = None
     try:
         proc = subprocess.Popen([TAIL, "-n", "0", "-f", logpath], stdout=subprocess.PIPE, text=True, errors="replace")
-        repeat_buf = []  # buffer identical lines; flush if run < FRAME_ENTERS
+        assert proc.stdout is not None
+        repeat_buf: list[str] = []  # buffer identical lines; flush if run < FRAME_ENTERS
         for raw_line in proc.stdout:
             r = _filter_line(raw_line)
             if r is None:
@@ -1180,14 +1209,14 @@ def cmd_watch(session):
         if proc is not None and proc.poll() is None: proc.kill(); proc.wait()
     return 0
 
-def cmd_history(session, n=5):
+def cmd_history(session: str, n: int = 5) -> int:
     if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
     if not os.path.exists(logpath): print(f"ERR {_no_log_output(session)}"); return 1
     with _open_private(logpath, os.O_RDONLY, "r", errors="replace") as f: raw_lines = f.readlines()
     filtered = [r for line in raw_lines if (r := _filter_line(line)) is not None]
     # suppress runs of FRAME_ENTERS+ identical lines (frame noise), keep shorter runs
-    out = []
+    out: list[str] = []
     i = 0
     while i < len(filtered):
         j = i + 1
@@ -1204,11 +1233,13 @@ def cmd_history(session, n=5):
 # MAIN
 # ═══════════════════════════════════════════
 
-def main():
+def main() -> int:
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__.strip()); return 0
     verb, rest = args[0], args[1:]
+    prompt: str | None
+    s: str | None
 
     if verb == "_bg" and len(rest) >= 5:
         session, cell_id, offset, echo, tout = rest[:5]
@@ -1218,7 +1249,7 @@ def main():
         return 0
 
     if verb == "new" and rest:
-        prompt = None; cmd_parts = []
+        prompt = None; cmd_parts: list[str] = []
         for a in rest[1:]:
             if a.startswith("--prompt="): prompt = a[len("--prompt="):]
             else: cmd_parts.append(a)

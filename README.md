@@ -279,6 +279,7 @@ error:       {"session": "...", "status": "error",  "message": "...", "ts": "...
 python tests/test_contracts.py      # static code contracts, no tmux
 python tests/test_bridge_contracts.py # Codex bridge type-seal contracts, no app-server
 python tests/test_docs.py           # docs/package drift, no tmux
+python -m mypy --platform linux src vendor tests # POSIX type surface
 bash tests/test.sh                  # 66 tests (64 without gdb), runtime smoke suite
 python tests/test_regressions.py    # targeted audit regressions
 python tests/run_all.py             # all suites

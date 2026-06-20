@@ -3,6 +3,7 @@
 
 import ast
 from pathlib import Path
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 K_PATH = ROOT / "src" / "agent_tty" / "cli.py"
@@ -52,7 +53,8 @@ def segment(src: str, node: ast.AST | None) -> str:
     if node is None:
         return ""
     lines = src.splitlines()
-    return "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    positioned = cast(Any, node)
+    return "\n".join(lines[positioned.lineno - 1 : positioned.end_lineno])
 
 
 def call_lines(node: ast.FunctionDef | None, name: str) -> list[int]:
@@ -73,6 +75,22 @@ def check_no_except_pass(name: str, tree: ast.Module) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler) and any(isinstance(n, ast.Pass) for n in node.body):
             FAILURES.append(f"{name}:{node.lineno}: except handler must not pass silently")
+
+
+def check_function_annotations(label: str, tree: ast.Module) -> None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        args = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+        if node.args.vararg is not None:
+            args.append(node.args.vararg)
+        if node.args.kwarg is not None:
+            args.append(node.args.kwarg)
+        missing = [arg.arg for arg in args if arg.arg != "self" and arg.annotation is None]
+        if missing:
+            FAILURES.append(f"{label}:{node.lineno}: missing arg annotations on {node.name}: {', '.join(missing)}")
+        if node.returns is None:
+            FAILURES.append(f"{label}:{node.lineno}: missing return annotation on {node.name}")
 
 
 def with_body_segment(src: str, node: ast.FunctionDef | None, guard_name: str) -> str:
@@ -97,6 +115,9 @@ def with_body_segment(src: str, node: ast.FunctionDef | None, guard_name: str) -
 check_no_except_pass("cli.py", K_TREE)
 check_no_except_pass("monitor.py", KM_TREE)
 check_no_except_pass("_shared.py", SHARED_TREE)
+check_function_annotations("cli.py", K_TREE)
+check_function_annotations("monitor.py", KM_TREE)
+check_function_annotations("_shared.py", SHARED_TREE)
 
 cmd_fire = function(K_TREE, "cmd_fire")
 cmd_run = function(K_TREE, "cmd_run")
@@ -171,10 +192,12 @@ for fn_name, fn in (("cmd_fire", cmd_fire), ("cmd_run", cmd_run)):
     check(f"{fn_name}: send_code exists", bool(send))
     check(f"{fn_name}: calls mark_sent", "mark_sent()" in seg)
     check(f"{fn_name}: pipe failure path", "pipe failed" in seg)
+    if fn is None:
+        continue
     # lock (CellLock) before pipe/send
     cl_lines = [child.lineno for child in ast.walk(fn)
                 if isinstance(child, ast.Call)
-                and isinstance(getattr(child, 'func', None), ast.Name)
+                and isinstance(child.func, ast.Name)
                 and child.func.id == "CellLock"]
     if cl_lines and ensure and send:
         check(f"{fn_name}: lock before pipe/send",

@@ -25,6 +25,8 @@ Architecture:
   This is the .then() callback mechanism.
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import json
@@ -33,6 +35,7 @@ import signal
 import subprocess
 
 from datetime import datetime, timezone
+from typing import Any
 
 _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src not in sys.path:
@@ -58,7 +61,10 @@ from agent_tty._shared import (
 )
 
 
-def _emit(d: dict):
+JsonMap = dict[str, Any]
+
+
+def _emit(d: JsonMap) -> None:
     """One JSON line to stdout = one agent interrupt."""
     d["ts"] = datetime.now(timezone.utc).isoformat()
     sys.stdout.write(json.dumps(d, ensure_ascii=False) + "\n")
@@ -69,23 +75,23 @@ class E:
     """km event factory."""
 
     @staticmethod
-    def started(cell_id: str, session: str):
+    def started(cell_id: str, session: str) -> None:
         _emit({"cell_id": cell_id, "session": session, "status": FIRED})
 
     @staticmethod
-    def completed(cell_id: str, session: str, status: str = DONE):
+    def completed(cell_id: str, session: str, status: str = DONE) -> None:
         _emit({"cell_id": cell_id, "session": session, "status": status})
 
     @staticmethod
-    def notify(session: str, who: str, message: str):
+    def notify(session: str, who: str, message: str) -> None:
         _emit({"session": session, "status": NOTIFY, "from": who, "message": message})
 
     @staticmethod
-    def closed(session: str):
+    def closed(session: str) -> None:
         _emit({"session": session, "status": CLOSED})
 
     @staticmethod
-    def error(session: str, message: str):
+    def error(session: str, message: str) -> None:
         _emit({"session": session, "status": ERROR, "message": message})
 
 
@@ -106,14 +112,14 @@ def start_pipe(session: str) -> str:
     return logfile
 
 
-def stop_pipe(session: str, logfile: str, tail_proc=None):
+def stop_pipe(session: str, logfile: str, tail_proc: subprocess.Popen[str] | None = None) -> None:
     """Cleanup: kill tail. Don't stop pipe-pane or remove log — k owns those."""
     if tail_proc and tail_proc.poll() is None:
         tail_proc.kill()
         tail_proc.wait()
 
 
-def monitor(session: str, cell_id: str = None, oneshot: bool = False):
+def monitor(session: str, cell_id: str | None = None, oneshot: bool = False) -> int:
     # verify session
     r = subprocess.run([TMUX, "has-session", "-t", session], capture_output=True)
     if r.returncode != 0:
@@ -121,12 +127,12 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
         return 1
 
     logfile = start_pipe(session)
-    tail_proc = None
+    tail_proc: subprocess.Popen[str] | None = None
 
-    def cleanup(*_):
+    def cleanup(*_: object) -> None:
         stop_pipe(session, logfile, tail_proc)
 
-    def request_stop(*_):
+    def request_stop(*_: object) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, request_stop)
@@ -137,8 +143,8 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
         # started. With no cell_id, return the latest fired cell that completed.
         scan_offset = None
         if oneshot:
-            seen_fired = set()
-            last_completion = None
+            seen_fired: set[str] = set()
+            last_completion: tuple[str, str] | None = None
             try:
                 with open_private(logfile, os.O_RDONLY, "rb") as f:
                     for raw_line in f:
@@ -185,6 +191,7 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
             bufsize=1,
         )
 
+        assert tail_proc.stdout is not None
         for raw_line in tail_proc.stdout:
             line = ANSI_RE.sub("", raw_line).strip()
             if not line:
@@ -226,7 +233,7 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
         cleanup()
 
 
-def main():
+def main() -> int:
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__.strip())
@@ -234,7 +241,7 @@ def main():
 
     session = args[0]
     validate_name(session, prefix="km:")
-    cell_id = None
+    cell_id: str | None = None
     oneshot = False
 
     for arg in args[1:]:

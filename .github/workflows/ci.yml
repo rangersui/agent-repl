@@ -34,6 +34,12 @@ jobs:
       - name: Upgrade packaging tools
         run: python -m pip install --upgrade pip build twine
 
+      - name: Type check (mypy)
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install mypy
+          python -m mypy src vendor tests
+
       - name: Compile source and tests
         run: |
           python -m compileall src tests

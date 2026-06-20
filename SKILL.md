@@ -78,7 +78,7 @@ For REPLs where empty Enter has side effects (gdb repeats last command).
 
 ### Hook: `--prompt=./detect.py`
 
-k feeds output lines to the hook's stdin. Hook exit means the frame is done. Hook paths must include a path separator (`/`). The path is canonicalised at `k new` time; the hook file must exist and be executable (`chmod +x`).
+k feeds ANSI-stripped, whitespace-stripped output lines to the hook's stdin. Hook exit means the frame is done; k treats the line that triggered the exit as the frame boundary and removes it from output. Hook paths must include a path separator (`/`). The path is canonicalised at `k new` time; the hook file must exist and be executable (`chmod +x`).
 
 ```python
 #!/usr/bin/env python3

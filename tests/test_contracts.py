@@ -248,6 +248,16 @@ create_seg = segment(K_SRC, create_fn)
 check("hook: canonicalises path", "os.path.abspath(os.path.expanduser(prompt))" in new_seg)
 check("hook: checks executable", "os.access(prompt, os.X_OK)" in new_seg)
 check("hook: runtime uses absolute file path", "os.path.isabs(prompt)" in stream_seg and '"/" in prompt' not in stream_seg)
+check("prompt: string mode strips whitespace", "prompt = prompt.strip()" in new_seg)
+check("prompt: empty after strip is rejected", "ERR empty prompt" in new_seg)
+check("_create: no redundant prompt strip", "prompt.strip()" not in create_seg,
+      "_create should store prompt as-is; normalisation belongs in cmd_new")
+check("exact match: capture-pane fallback for pipe buffering",
+      "_pane_shows_prompt(session, prompt)" in stream_seg,
+      "exact match needs capture-pane polling; pipe-pane buffers prompts without trailing newline")
+check("exact match: capture-pane is rate-limited",
+      "_PANE_POLL_INTERVAL" in K_SRC and "last_pane_poll" in stream_seg,
+      "capture-pane polling must be throttled to avoid hammering tmux")
 
 main_seg = segment(K_SRC, main)
 check("new: reports create failure without traceback", "ERR create failed" in new_seg)

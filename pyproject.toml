@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-tty"
-version = "0.1.1"
+version = "0.1.2"
 description = "Persistent TTY for AI agents, shared live terminal for humans"
 readme = "README.md"
 license = "MIT"

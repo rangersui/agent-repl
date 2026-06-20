@@ -1,4 +1,4 @@
-.TH AGENT-TTY 1 "June 2026" "agent-tty 0.1.1" "User Commands"
+.TH AGENT-TTY 1 "June 2026" "agent-tty 0.1.2" "User Commands"
 .SH NAME
 agent-tty \- persistent TTY for AI agents, shared live terminal for humans
 .SH SYNOPSIS
@@ -114,7 +114,9 @@ on PowerShell.
 .TP
 .B k new SESSION [CMD...] [--prompt=x]
 Create a tmux session. Without CMD, starts bash. A prompt containing a path separator
-enables hook mode; the hook path is canonicalised at creation time.
+enables hook mode; the hook path is canonicalised at creation time. In hook mode,
+k feeds stripped lines to the hook's stdin; hook exit means frame done, and the
+triggering line is removed from output.
 .TP
 .B k fire [-t N] [SESSION] CODE
 Send CODE asynchronously. Returns

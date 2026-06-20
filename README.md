@@ -134,7 +134,7 @@ Three modes via `--prompt`:
 | `"(gdb)"`   | exact  | match prompt string                         |
 | `./hook.py` | hook   | stdin lines → hook exit → done            |
 
-Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Hook paths must include a path separator (`/`). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
+Hook protocol: k feeds ANSI-stripped, whitespace-stripped lines to stdin. Hook exit = frame done; the line that triggered the exit is treated as the frame boundary and removed from output. Hook paths must include a path separator (`/`). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
 
 ## How It Works
 

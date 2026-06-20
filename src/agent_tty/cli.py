@@ -394,7 +394,7 @@ def _create(session: str, cmd: str, prompt: str | None = None) -> None:
         time.sleep(1.0)
         meta: JsonMap = {"name": session, "cmd": cmd}
         if prompt:
-            meta["prompt"] = prompt  # explicit prompt → exact match mode
+            meta["prompt"] = prompt  # already normalised by cmd_new
         with _open_private(_meta(session), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, "w") as f:
             json.dump(meta, f)
     except BaseException:
@@ -612,6 +612,29 @@ class CellLock:
 # (= REPL redrawing prompt on empty Enter)
 # ═══════════════════════════════════════════
 
+_PANE_POLL_INTERVAL = 0.3   # seconds between capture-pane checks (exact match only)
+
+def _pane_shows_prompt(session: str, prompt: str) -> bool:
+    """Check if the last non-empty line on the tmux pane matches the prompt.
+
+    tmux pipe-pane buffers data internally and only flushes on newline-
+    bearing writes.  REPL prompts sit without a trailing newline, so they
+    appear on screen but never reach the log file.  This function reads the
+    live pane content via ``capture-pane`` as a reliable fallback for exact-
+    match completion detection.
+    """
+    r = subprocess.run(
+        [TMUX, "capture-pane", "-t", session, "-p"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return False
+    for line in reversed(r.stdout.split("\n")):
+        clean = ANSI_RE.sub("", line).strip()
+        if clean:
+            return clean == prompt
+    return False
+
 def _stream_process(
     session: str,
     cell_id: str,
@@ -645,6 +668,7 @@ def _stream_process(
 
     last_appended = False  # tracks if last line was appended (not filtered)
     timed_out = False
+    last_pane_poll = 0.0   # monotonic time of last capture-pane check
 
     try:
         with _open_private(logpath, os.O_RDONLY, "r", errors="replace") as f:
@@ -661,6 +685,32 @@ def _stream_process(
                         if output and last_appended:
                             output.pop()
                         break
+
+                    # Exact match fallback: tmux pipe-pane buffers prompts
+                    # that lack a trailing newline.  Poll capture-pane so we
+                    # can still detect the prompt on screen.
+                    if prompt and state == "OUTPUT":
+                        now = time.monotonic()
+                        if now - last_pane_poll >= _PANE_POLL_INTERVAL:
+                            last_pane_poll = now
+                            if _pane_shows_prompt(session, prompt):
+                                # drain any remaining log lines into output
+                                while True:
+                                    extra = f.readline()
+                                    if not extra:
+                                        break
+                                    ec = ANSI_RE.sub("", extra).strip()
+                                    if not ec:
+                                        continue
+                                    if CELL_EVENT_RE.match(ec) or NOTIFY_EVENT_RE.match(ec):
+                                        continue
+                                    if ec == prompt:
+                                        break
+                                    if ec == "..." or ec.startswith("... "):
+                                        continue
+                                    output.append(ec)
+                                break  # prompt found — frame done
+
                     time.sleep(0.05)
                     continue
 
@@ -850,6 +900,11 @@ def cmd_new(session: str, cmd_parts: list[str], prompt: str | None = None) -> in
             print(f"ERR hook not readable: {prompt}"); return 1
         if not os.access(prompt, os.X_OK):
             print(f"ERR hook not executable: {prompt}"); return 1
+    elif prompt:
+        # string mode: strip to match stream processor line normalisation
+        prompt = prompt.strip()
+        if not prompt:
+            print("ERR empty prompt"); return 1
     cmd = " ".join(cmd_parts) if cmd_parts else "bash"
     try:
         _create(session, cmd, prompt)

@@ -176,6 +176,44 @@ k run -j py "print(factorial(10))"
 # 3628800
 ```
 
+## Quoting Rule
+
+Code with quotes, backslashes, f-strings, or nested escaping often breaks when passed through bash_tool → shell → k → tmux → REPL. Do not try to escape your way out.
+
+**Write to file, then load:**
+
+```bash
+# bash: write + source
+cat > /tmp/task.sh << 'EOF'
+for f in *.log; do
+    grep -q "ERROR" "$f" && echo "$f has errors"
+done
+EOF
+k run -j work "source /tmp/task.sh"
+
+# python: write + exec
+cat > /tmp/task.py << 'EOF'
+d = {"product_id": "BTC", "price": "104.50"}
+print(f"{d.get('product_id')} = ${d.get('price')}")
+EOF
+k run -j py "exec(open('/tmp/task.py').read())"
+```
+
+**Inline is fine when code has no quoting conflicts:**
+
+```bash
+k run -j work "echo hello && ls -la"
+k run -j py "print(42)"
+k run -j py "
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n-1)
+"
+```
+
+The rule: if the code has `"` or `'` or `\` or `$` inside string literals, write it to a file.
+
 ## Language Notes
 
 k is REPL-agnostic. Any program with a readline prompt works:

@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""k -- auth wrapper for agent-tty.py (Windows / TCP mode).
+
+On Windows (or any platform without AF_UNIX), the daemon generates a
+random token at startup and prints it to stderr:
+
+    k daemon pid=12345 127.0.0.1:7399 mode=socket token=abc123...
+    export K_TOKEN=abc123...
+
+Copy that token into K_TOKEN below, and set K_PORT to match.
+Then use this script instead of calling agent-tty.py directly:
+
+    python k.py ls
+    python k.py new default
+    python k.py run default "2+2"
+    python k.py attach default
+
+On POSIX with AF_UNIX support, the daemon uses /tmp/k.sock and needs
+no token.  You can call agent-tty.py directly:
+
+    python3 agent-tty.py ls
+
+Why this file exists:
+  agent-tty.py reads K_TOKEN and K_PORT from env vars to authenticate
+  TCP clients.  This wrapper sets those vars so you don't have to
+  export them in every shell.  Copy this file to k.py and fill in
+  the real values -- k.py is gitignored so your token stays local.
+"""
+import os, sys, subprocess
+
+# Paste the token from daemon stderr output here.
+K_TOKEN = "PASTE_TOKEN_HERE"
+
+# The TCP port the daemon listens on (default 7399).
+K_PORT = "7399"
+
+here = os.path.dirname(os.path.abspath(__file__))
+os.environ["K_TOKEN"] = K_TOKEN
+os.environ["K_PORT"] = K_PORT
+sys.exit(subprocess.call([sys.executable, os.path.join(here, "agent-tty.py")] + sys.argv[1:]))

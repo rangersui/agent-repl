@@ -7,3 +7,4 @@ build/
 .eggs/
 .codex-tmux-outbox.txt
 local/
+k.py

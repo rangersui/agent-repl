@@ -1,22 +1,48 @@
 #!/usr/bin/env python3
-"""k -- pure Python. No tmux. No frame detection.
+"""agent-tty.py -- persistent Python runtime for AI agents.
 
-Each session = isolated subprocess with persistent Python namespace.
-fire is queued: multiple fires in one session execute serially.
-For parallel execution, use multiple sessions.
+Each session owns a long-lived Python namespace in a child process.  AI commands
+enter that namespace as eval/exec cells; shell commands, browsers, databases,
+packet capture, and other external tools are reached from that live process
+through Python libraries or subprocess.
 
-POSIX: sessions use real PTY (readline, tab completion, arrow keys).
-Windows: sessions use InteractiveConsole over TCP socket.
+Execution model:
+  - run executes one cell synchronously and returns captured stdout/stderr.
+  - fire starts a background cell and returns a cell_id immediately.
+  - poll reads a fired cell by cell_id, or the most recent cell if omitted.
+  - fire is queued inside one session: cells execute serially under one lock.
+  - For real parallel execution, create multiple sessions.
 
-    k daemon                  start daemon (foreground)
-    k new <name>              create session
-    k kill <name>             terminate session process
-    k run <name> "code"       sync exec, return output
-    k fire <name> "code"      async exec, return cell_id
-    k poll <name> [cell_id]   check async result
-    k status <name>           session health
+Human interaction:
+  - POSIX sessions use a real PTY: readline, tab completion, arrows, Ctrl-C.
+  - Windows sessions expose InteractiveConsole through a local TCP socket.
+  - attach connects a human to the same live namespace the AI is using.
+
+Transport:
+  - AF_UNIX mode uses filesystem-local K_SOCK, default /tmp/k.sock.
+  - TCP fallback uses 127.0.0.1:K_PORT and requires K_TOKEN.
+  - The daemon prints the token; k.py.template is a local wrapper template that
+    stores K_TOKEN/K_PORT so agent calls stay short.  The real k.py is ignored.
+
+Commands:
+    k daemon                  start daemon in foreground
+    k new <name>              create a Python session
+    k kill <name>             terminate session process and forget it
+    k run <name> "code"       sync Python eval/exec, print raw output
+    k fire <name> "code"      async queued eval/exec, print JSON cell_id
+    k poll <name> [cell_id]   print JSON cell result
+    k status <name>           print JSON session state
+    k vars <name>             print JSON list of public namespace names
+    k complete <name> "text"  print JSON Python completion candidates
     k ls                      list sessions
-    k attach <name>           interactive REPL (human types directly)
+    k attach <name>           attach human REPL to the session
+
+Output formats:
+    new, kill, ls             text
+    run                       raw captured output
+    fire, poll, status,
+    vars, complete            JSON
+    attach                    interactive stream
 """
 import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile, code
 import signal, subprocess
@@ -45,6 +71,12 @@ SOCK = os.environ.get("K_SOCK", _default_sock())
 # -----------------------------------------------
 
 def _server_socket():
+    """Create the daemon control socket.
+
+    AF_UNIX mode is path-based and intended for POSIX local use.  TCP mode is
+    loopback-only and must be authenticated with K_TOKEN because any local
+    process can attempt to connect to the port.
+    """
     if _HAS_AF_UNIX:
         if os.path.exists(SOCK):
             os.unlink(SOCK)
@@ -61,6 +93,7 @@ def _server_socket():
     return srv
 
 def _client_socket():
+    """Connect to the daemon control socket selected by K_SOCK or K_PORT."""
     if _HAS_AF_UNIX:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(SOCK)
@@ -75,13 +108,25 @@ def _client_socket():
 # =============================================
 
 def _init_namespace():
+    """Create the persistent Python namespace for one session.
+
+    The imports here are convenience imports for agent cells.  Code running in
+    a session has normal Python process permissions.
+    """
     ns = {"__builtins__": __builtins__}
     exec("import os,sys,json,subprocess,shutil,hashlib,time,re,glob,sqlite3,socket", ns)
     return ns
 
 def _make_exec(ns, lock, on_done=None):
-    """Build _exec(src): eval/exec in ns, return captured output.
-    on_done(src, output) called after execution if provided."""
+    """Build _exec(src): eval/exec in ns and return captured output.
+
+    Strings are printed as raw text; non-strings are repr()'d like a REPL.
+    stdout/stderr redirection is protected by lock so queued run/fire cells keep
+    output capture coherent.
+
+    on_done(src, output), when provided, broadcasts completed AI cells to an
+    attached human REPL.
+    """
     def _exec(src):
         with lock:
             buf = io.StringIO()
@@ -108,7 +153,11 @@ def _make_exec(ns, lock, on_done=None):
     return _exec
 
 def _dispatch(cmd, args, _exec, cells, ns):
-    """Handle one AI command, return response dict."""
+    """Handle one AI protocol command inside a session.
+
+    This function returns dictionaries only.  The daemon decides which commands
+    are rendered as raw text versus JSON at the client boundary.
+    """
     if cmd == "run":
         return {"output": _exec(args[0])}
     elif cmd == "fire":
@@ -162,8 +211,12 @@ def _dispatch(cmd, args, _exec, cells, ns):
 
 def session_worker_pty(ai_sock):
     """Runs in subprocess with PTY slave as stdin/stdout/stderr.
-    AI communicates via ai_sock (socketpair, JSON-line protocol).
-    Human gets real readline, real tab completion, real everything."""
+
+    POSIX human attach goes through the PTY and therefore gets real readline,
+    tab completion, terminal signals, and normal Python REPL behaviour.  AI
+    commands use ai_sock, a private socketpair using one JSON object per line.
+    Both paths share the same namespace and lock.
+    """
     ns = _init_namespace()
     cells = {}
     lock = threading.Lock()
@@ -214,12 +267,13 @@ def session_worker_pty(ai_sock):
             with lock:
                 return super().runsource(source, filename, symbol)
 
-    # loop so Ctrl-D = detach (restart prompt), not kill session.
-    # exit() raises SystemExit = actually kill.
+    # Ctrl-] is handled by the attach client and detaches the human.  If EOF
+    # reaches the Python console anyway, restart the prompt so the session
+    # stays alive.  exit() raises SystemExit and intentionally kills it.
     while True:
         try:
             LockedConsole(locals=ns).interact(
-                banner="shared with AI. Ctrl-D to detach. exit() to kill.",
+                banner="shared with AI. Ctrl-] detaches. exit() kills session.",
                 exitmsg="")
         except SystemExit:
             break
@@ -230,7 +284,11 @@ def session_worker_pty(ai_sock):
 
 def session_worker(rx, tx):
     """Runs in mp.Process. InteractiveConsole over TCP socket for human.
-    AI via mp.Pipe (rx/tx)."""
+
+    This path serves platforms that use the socket console.  A local TCP REPL
+    server gives the human an InteractiveConsole; the AI channel uses
+    multiprocessing Pipe.  Both share the same namespace and execution lock.
+    """
     ns = _init_namespace()
     cells = {}
     _lock = threading.Lock()
@@ -238,6 +296,7 @@ def session_worker(rx, tx):
     _watchers_lock = threading.Lock()
 
     def _broadcast(src, output):
+        """Show completed AI cells to currently attached Windows clients."""
         with _watchers_lock:
             lines = src.strip().splitlines()
             for wf in _watchers[:]:
@@ -301,7 +360,7 @@ def session_worker(rx, tx):
                 _watchers.append(wf)
             try:
                 c = SharedConsole(ns, _lock, rf, wf)
-                c.interact(banner="shared with AI. Ctrl-D to detach.",
+                c.interact(banner="shared with AI. EOF detaches.",
                            exitmsg="detached")
             except (OSError, EOFError):
                 pass
@@ -334,9 +393,15 @@ sessions = {}
 _daemon_token = None
 
 def _start_pty_bridge(master_fd):
-    """Always-reading bridge: PTY master fd <-> attached TCP client.
-    Reads master_fd continuously (prevents PTY buffer deadlock).
-    Buffers recent output so first attach sees banner + prompt."""
+    """Start the human attach bridge for a POSIX PTY session.
+
+    The bridge continuously drains the PTY master fd so detached sessions keep
+    making progress.  Recent output is kept as small scrollback so the next
+    attach sees the current prompt/context.
+
+    Returns (port, server_socket).  The daemon stores server_socket and closes
+    it during kill_session() for explicit cleanup.
+    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -408,6 +473,7 @@ def _start_pty_bridge(master_fd):
     return port, srv
 
 def new_session(name):
+    """Create or replace one named Python session."""
     if name in sessions:
         kill_session(name)
     if _HAS_PTY:
@@ -441,6 +507,7 @@ def new_session(name):
         }
 
 def kill_session(name):
+    """Terminate one named session and close all daemon-owned resources."""
     if name not in sessions:
         return False
     s = sessions[name]
@@ -472,6 +539,7 @@ def kill_session(name):
     return True
 
 def send_session(name, msg, timeout=30):
+    """Send one AI command to a session and wait for its response."""
     s = sessions[name]
     if s["type"] == "pty":
         try:
@@ -495,6 +563,7 @@ def send_session(name, msg, timeout=30):
         return {"error": "timeout"}
 
 def handle_client(cmd, args):
+    """Handle one daemon control command from a client process."""
     if cmd == "new":
         if not args:
             return "ERR usage: k new <name>"
@@ -561,6 +630,12 @@ def handle_client(cmd, args):
     return f"ERR unknown: {cmd}"
 
 def daemon():
+    """Run the daemon event loop until interrupted.
+
+    The daemon owns session processes and control sockets.  It is intentionally
+    foreground-friendly: stderr shows token/mode information and echoes AI-run
+    cells so humans can observe what the agent is doing.
+    """
     global _daemon_token
     srv = _server_socket()
     srv.listen(8)
@@ -631,6 +706,7 @@ def _send(cmd, args):
     return resp.decode()
 
 def client(cmd, args):
+    """CLI client for non-interactive commands."""
     resp = _send(cmd, args)
     if resp is None:
         print("ERR daemon not running -- start: k daemon", file=sys.stderr)
@@ -639,7 +715,11 @@ def client(cmd, args):
         print(resp)
 
 def attach(name):
-    """Connect to session REPL. Raw terminal on POSIX, line-based on Windows."""
+    """Connect a human terminal to a session REPL.
+
+    POSIX attach is raw; Ctrl-] returns to the shell while the session stays
+    alive.  Windows attach is line-based; ending stdin detaches.
+    """
     resp = _send("repl_port", [name])
     if resp is None:
         print("ERR daemon not running", file=sys.stderr)
@@ -655,7 +735,7 @@ def attach(name):
 
 def _attach_pty(port):
     """Raw terminal: forward keystrokes to PTY, display output.
-    Ctrl-] to detach (session stays alive)."""
+    Ctrl-] returns to the shell; the session stays alive."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(("127.0.0.1", port))
     old = termios.tcgetattr(sys.stdin)
@@ -683,7 +763,7 @@ def _attach_pty(port):
         s.close()
 
 def _attach_socket(port):
-    """Line-based attach for Windows (InteractiveConsole over socket)."""
+    """Line-based attach for Windows InteractiveConsole over socket."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(("127.0.0.1", port))
     done = threading.Event()

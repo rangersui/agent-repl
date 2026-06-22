@@ -1,6 +1,0 @@
-#!/usr/bin/env python3
-"""Shim — delegates to agent_tty.cli. Works without pip install."""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
-from agent_tty.cli import main
-sys.exit(main())

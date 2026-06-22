@@ -163,7 +163,7 @@ def main():
             resp = send_cmd(sock_path, "complete", ["test1", "os.path."])
             check("complete-returns", "join", resp)
 
-            # -- worker is a real subprocess, not fork --
+            # -- worker is owned by the daemon process tree --
             resp = send_cmd(sock_path, "run", ["test1", "os.getppid()"])
             check("worker-not-daemon-child",
                   str(daemon.pid) if sys.platform != "win32" else "",

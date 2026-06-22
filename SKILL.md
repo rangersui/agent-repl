@@ -27,6 +27,12 @@ k new py python3 -i
 k run -j py "x = 42"
 k run -j py "print(x)"              # state persists: x is still alive
 
+# async: fire returns immediately, poll when ready
+k fire work "sleep 2 && echo built"
+# {"cell_id":"a1b2c3d4e5f6","status":"fired"}
+k poll work
+# {"cell_id":"a1b2c3d4e5f6","status":"done","output":"built"}
+
 k new dbg "gdb -q ./app" --prompt="(gdb)"
 k run -j dbg "break main"
 ```
@@ -148,7 +154,31 @@ The ctrl session sends code strings to the worker via Unix socket; the worker `e
 
 Key constraint: Playwright's sync API uses greenlets bound to the main thread. A threaded socket server fails with `cannot switch to a different thread`. The worker must handle requests serially on the main thread. This applies to any library that assumes single-threaded event loop ownership (asyncio, greenlet, some GPU runtimes).
 
-## JSON Schema
+## Output Formats
+
+Each command has a fixed output format — JSON or text, never mixed:
+
+| Command | Format | Shape |
+|---------|--------|-------|
+| `k new` | text | `OK <session>` or `ERR ...` |
+| `k fire` | JSON | `{"cell_id":"...","status":"fired"}` |
+| `k poll` | JSON | cell result; status = running/done/timeout/error |
+| `k run -j` | JSON | same as poll result |
+| `k run` (no -j) | text | raw command output |
+| `k int` | text | `OK` or `ERR ...` |
+| `k kill` | text | `OK killed <session>` |
+| `k ls` | text | session names, one per line |
+| `k status` | text | `OK <session> pipe=ok state=<state> next='...'` |
+| `k notify` | text | `OK notified: <message>` |
+| `k watch` | text | streaming filtered log lines |
+| `k history` | text | last N×5 filtered log lines |
+| `km` | JSON lines | event object; always session/status/ts, cell_id only for cell events |
+
+`k fire`, `k poll`, and `k run -j` always return JSON — parseable by the agent.
+`k run` without `-j` returns raw text — for human-readable output.
+`km` events include `session` and `ts` fields that `k` outputs do not.
+
+### JSON shapes (k)
 
 ```
 fired:        {"cell_id": "...", "status": "fired"}
@@ -160,7 +190,7 @@ error:        {"status": "error", "output": "..."}
 cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
-JSON errors without `cell_id`: `no session 'x'; use k new x bash`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`, `invalid cell_id`.
+JSON errors without `cell_id`: `no session 'x'; use k new x bash`, `active cell '{id}'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`, `invalid cell_id`.
 JSON errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `result missing`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
 Text-only errors: `no session found; use k ls or k new <session> bash`, `no log for 'x'; use k status x`, `watcher kill failed; use k kill`.
 

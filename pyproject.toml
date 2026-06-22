@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-tty"
 version = "0.2.0"
-description = "Persistent TTY for AI agents, shared live terminal for humans"
+description = "Persistent Python runtime for AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -20,10 +20,13 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: System :: Shells",
 ]
+dependencies = [
+    "pywinpty; sys_platform == 'win32'",
+]
+
+[project.scripts]
+k = "agent_tty:main"
 
 [project.urls]
 Homepage = "https://github.com/rangersui/agent-tty"
 Repository = "https://github.com/rangersui/agent-tty"
-
-[project.optional-dependencies]
-pty = ["pywinpty; sys_platform == 'win32'"]

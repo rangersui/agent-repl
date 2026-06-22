@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
-"""k -- local auth wrapper for agent-tty.py TCP mode.
+"""k -- local auth wrapper for agent_tty.py TCP mode.
 
 In TCP mode, the daemon generates a random token at startup and prints it to
 stderr:
 
     k daemon pid=12345 127.0.0.1:7399 mode=socket token=abc123...
+
+Windows:
+
+    set K_TOKEN=abc123...
+
+Linux/macOS TCP:
+
     export K_TOKEN=abc123...
 
 Copy that token into K_TOKEN below, and set K_PORT to match.  Save this file as
-k.py next to agent-tty.py.  Then use the wrapper for short local commands:
+k.py next to agent_tty.py.  Then use the wrapper for short local commands:
 
     python k.py ls
     python k.py new default
     python k.py run default "2+2"
     python k.py attach default
 
-In AF_UNIX mode, the daemon listens on /tmp/k.sock by default.  Direct calls are
-already short:
+In AF_UNIX mode, the daemon listens on /tmp/k.sock by default.  Installed
+commands are already short:
 
-    python3 agent-tty.py ls
+    k ls
 
 Why this file exists:
-  agent-tty.py reads K_TOKEN and K_PORT from env vars to authenticate
+  agent_tty.py reads K_TOKEN and K_PORT from env vars to authenticate
   TCP clients.  This wrapper supplies those vars for each local command.  Copy
   this file to k.py and fill in the real values.
 
@@ -40,4 +47,4 @@ K_PORT = "7399"
 here = os.path.dirname(os.path.abspath(__file__))
 os.environ["K_TOKEN"] = K_TOKEN
 os.environ["K_PORT"] = K_PORT
-sys.exit(subprocess.call([sys.executable, os.path.join(here, "agent-tty.py")] + sys.argv[1:]))
+sys.exit(subprocess.call([sys.executable, os.path.join(here, "agent_tty.py")] + sys.argv[1:]))

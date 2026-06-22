@@ -1,444 +1,340 @@
 # agent-tty
 
-*tmux is all u need: a boring old terminal multiplexer becomes an agent runtime primitive.*
+Persistent Python runtime for your AI agent.
 
-A persistent TTY for your AI agent. Shared live terminal for humans.
+Each session is a long-lived Python namespace in a child process. Agent cells
+enter that namespace through `eval`/`exec`, so imports, variables, open
+connections, servers, and in-memory decisions survive across agent turns.
 
-bash_tool runs a command and forgets. agent-tty gives your agent a
-persistent TTY inside tmux — variables, cwd, imports, connections, SSH
-sessions, and debugger state survive across agent turns. You watch the
-same terminal live, interrupt with `k int`, or take over with
-`tmux attach`.
+`bash_tool` is curl: every call forks a process, runs, and dies. `k` is a
+socket: one process stays alive, and every call is a function invocation inside
+it. The agent sends source code through a structured pipe and receives captured
+output. Humans attach through a real terminal with readline, tab completion,
+colors, and Ctrl-C. Both channels share the same namespace.
 
-The package is `agent-tty`. The CLI command is `k`, intentionally short to minimise token overhead in agent tool calls. `km` is the companion event monitor.
+Requires Python 3.10+.
 
-**Requires POSIX + tmux 3.0+** — k drives tmux, tail, and POSIX signals; it does not bundle or replace them.
+Install the CLI:
 
-## Why agent-tty
-
-`bash_tool` is curl. `k` is a socket.
-
-The terminal is the interface. The primitive is live process state:
-variables, connections, servers, sockets, and decisions that survive across
-turns. Static config becomes a live variable the agent changes in one cell —
-no restart, no redeploy. See EXAMPLES.md *Live Control Plane*.
-
-Give your agent `k` when it needs memory between turns: Python imports,
-database connections, browser/CDP sockets, remote shells, debuggers, running
-servers. You see everything through `k watch` — cell markers, completion
-ticks, frame noise hidden — or `tmux attach` for native raw takeover.
-
-`km` calls your agent back when a long cell finishes.
-`k poll` is a simple fallback for runtimes without monitor/interrupt support.
-
-Every agent-tty command is something you already do at a terminal:
-
+```bash
+python -m pip install agent-tty
+k --version
 ```
-k new      you open a terminal
-k run      you type a command and watch it finish
-k fire     you start a build and go get coffee
-k poll     you come back and check if it's done
-k int      you hit Ctrl-C
-k kill     you close the terminal
-k ls       you check how many terminal windows you have open
-k status   you glance at a terminal — running or dead?
-k watch    you sit down and watch output scroll
-k history  you scroll up to see what ran before
-k notify   you stick a note on a colleague's desk: "build's done"
-km         you set an alarm to go off when the build finishes
+
+From a source checkout, install editable once so `k` resolves to this tree:
+
+```bash
+python -m pip install -e .
+k --version
+```
+
+The code help is the single source of truth:
+
+```bash
+k --help
 ```
 
 ## Quick Start
 
-```bash
-k new work bash
-k run -j work "echo hello"
-# {"cell_id":"...","status":"done","output":"hello"}
-
-# async: fire returns immediately, poll when ready
-k fire work "make build"
-# {"cell_id":"a1b2c3d4e5f6","status":"fired"}
-k poll work
-# {"cell_id":"a1b2c3d4e5f6","status":"done","output":"..."}
-
-k new py python3 -i                         # Python 3.12 and below
-k new py "env PYTHON_BASIC_REPL=1 python3 -i"  # Python 3.13+ (line-protocol mode)
-k run -j py "print(42)"
-```
-
-State persists across cells — `export`, `cd`, `def`, variable assignments all
-survive between `k run` calls. That is the point: the session is a live process,
-not a fresh shell per call.
-
-Before install, `./scripts/k` is the same CLI entry point — no pip needed.
-After install, `k` with no arguments prints the full help.
-
-## Recommended Workflow
-
-The agent defaults to `k` — it is the shared working terminal, and you
-watch the same cwd/env/history/output the agent sees. For code with quotes,
-f-strings, SQL, shell variables, or any escaping complexity, the agent
-writes a file with its shell tool, then loads it through `k`.
+Start the daemon in one terminal:
 
 ```bash
-cat > /tmp/task.py << 'EOF'
-import os
-
-conn = db.connect(os.environ["DATABASE_URL"])
-rows = conn.execute("SELECT * FROM orders WHERE status = 'pending'").fetchall()
-print(f"found {len(rows)} pending orders")
-EOF
-k run -j py "exec(open('/tmp/task.py').read())"
+k daemon
 ```
 
-The heredoc preserves content literally. `source`/`exec` loads it into the live
-session, so imports, variables, cwd, sockets, and database handles still
-persist. This avoids shell-quoting fights and the multiline-send edge cases
-that can confuse frame detection: the command sent to `k` is always one
-simple line.
+Stop the daemon with `Ctrl-C` in that terminal. Daemon shutdown terminates owned
+sessions and closes the control socket.
 
-Simple commands still go straight through `k`: `k run -j work "echo hello"`.
-
-## Install
-
-Requires: **POSIX**, **Python 3.10+**, **tmux 3.0+**
+Use the client from another terminal:
 
 ```bash
-pip install agent-tty            # → k, km, agent-tty in PATH
+k new work
+k run work "x = 41"
+k run work "x + 1"
+# 42
 ```
 
-To refresh a stale `k`/`km` entry point, reinstall in the same shell environment
-that will run it, then verify the resolved command:
+Async cells:
 
 ```bash
-python -m pip install --upgrade --force-reinstall agent-tty
-k --version
-km --version
-agent-tty --version
-python -m agent_tty --version
-command -v k    # use: where.exe k  (PowerShell)
+k fire work "import time; time.sleep(2); y = x + 1"
+# {"cell_id": "a1b2c3d4e5f6", "status": "fired"}
+
+k poll work a1b2c3d4e5f6
+# {"cell_id": "a1b2c3d4e5f6", "status": "done", "output": ""}
+
+k run work "y"
+# 42
 ```
 
-Or without pip:
+Human attach:
 
 ```bash
-git clone <repo> && cd agent-tty
-./scripts/k --help               # works immediately (dev shim)
+k attach work
 ```
 
-Or symlink into PATH:
+On PTY and WinPTY sessions, `Ctrl-]` detaches and leaves the session alive.
+`exit()` exits the session process. On socket-console sessions, ending stdin
+detaches.
+
+## Runtime Model
+
+`k daemon` runs a foreground daemon. The daemon owns named session processes
+and a local control socket.
+
+Each session is a Python process with:
+
+- one persistent namespace,
+- one execution lock,
+- one cell table for async `fire` results,
+- one human attach surface.
+
+AI commands use a separate control path and share the same namespace as the
+human console.
+
+## Stateful First
+
+Most command tools are intentionally stateless: fork, run, die. That is simple
+for humans, but wasteful for agents. Agents repeat imports, reopen connections,
+re-parse configs, and rebuild intermediate data because the process disappears
+after every call.
+
+agent-tty flips that default. The process is the workspace. State is not a
+cleanup problem first; it is addressable memory.
+
+Things that stay alive:
+
+- Python variables, imports, compiled regexes, parsed configs, DataFrames, and
+  models,
+- database handles, HTTP sessions, WebSockets, TCP sockets, SSH tunnels, and
+  browser/CDP sessions,
+- Flask apps, local servers, file watchers, monitors, and other daemon threads,
+- live control-plane decisions such as feature flags, rate limits, blocked IP
+  sets, routing weights, and circuit breaker state.
+
+Static config can become a Python variable. Patch one cell; the next request
+sees it. No restart is needed for logic that already lives inside the session.
+
+## Two Channels, One Namespace
+
+The agent channel is structured: source code in, captured text/JSON out. It does
+not need to parse ANSI escape sequences, cursor movement, prompts, or screen
+redraws to know when a cell finished.
+
+The human channel is interactive: `k attach` connects to the same process
+through PTY, WinPTY, or socket-console mode. A human can inspect variables,
+interrupt with Ctrl-C, or detach with `Ctrl-]` without discarding the namespace.
+
+That split is the core design: pure data for agents, real terminal ergonomics
+for humans, one shared runtime underneath.
+
+## Session Modes
+
+agent-tty uses the best local console surface available:
+
+| mode | platform | human attach |
+| --- | --- | --- |
+| POSIX PTY | Linux, macOS, WSL | raw terminal, readline, tab, arrows, Ctrl-C |
+| WinPTY | Windows with `pywinpty` | raw terminal through WinPTY |
+| socket console | fallback | line-based `InteractiveConsole` over local TCP |
+
+PTY and WinPTY sessions support `Ctrl-]` to detach while the Python session
+keeps running. `exit()` exits the session process. Socket-console sessions
+detach when stdin ends.
+
+## Default Work Surface
+
+Default to the live session for project work. Once a daemon/session exists,
+commands that affect the task should go through `k run` or `k fire`, even when
+the command is as simple as `ls`, `pwd`, or `git status`.
+
+That keeps the work in one inspectable runtime: cwd changes, environment
+mutations, imports, open sockets, cached data, and command history all stay
+with the session the human can attach to.
+
+Use the host shell as plumbing:
+
+- start or stop the daemon,
+- copy `k.py.template` to `k.py` and fill in the token,
+- write larger Python cells to files before loading them,
+- inspect or repair the repository when no session is available.
+
+Inside the session, call host commands through Python:
 
 ```bash
-ln -sf "$(pwd)/scripts/k"  /usr/local/bin/k
-ln -sf "$(pwd)/scripts/km" /usr/local/bin/km
+k run work "import subprocess; subprocess.run(['git', 'status'])"
 ```
 
-## Commands
+## Command Reference
 
-```
-k new    <session> [cmd...] [--prompt="x"]     spawn (default: bash)
-k new    <session> <cmd> --prompt=./hook        hook mode
-k fire   [-t N] [session] <code>               async fire (default 300s)
-k poll   [session] [cell_id]                   poll (O(1))
-k run    [-j] [-t N] [session] <code>          sync (default 30s)
-k await  ...                                   alias for run
-k notify [session] <message>                   notification (direct to log)
-k int    [session]                             ctrl-c (+ re-frame in repeat mode)
-k kill   <session>                             kill + cleanup
-k ls                                           list tmux sessions
-k status [session]                             health + next action
-k watch  [session]                             live filtered view
-k history [-n N] [session]                     last N×5 lines (default 5)
-k --version                                    print agent-tty version
-                                                aliases: k -V, k version
+```text
+k daemon                  start daemon in foreground
+k new <name>              create a Python session
+k int <name>              interrupt running async cells
+k kill <name>             terminate session process and forget it
+k run <name> "code"       sync Python eval/exec, print raw output
+k fire <name> "code"      async queued eval/exec, print JSON cell_id
+k poll <name> [cell_id]   print JSON cell result
+k status <name>           print JSON session state
+k vars <name>             print JSON list of public namespace names
+k complete <name> "text"  print JSON Python completion candidates
+k ls                      list sessions
+k attach <name>           attach human REPL to the session
+k --version|-V|version    print version
 ```
 
-Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
-
-`k status work` repairs the log pipe if needed and prints the next useful command:
+`k new <name>` creates a Python session. Put host commands inside Python cells
+with `subprocess`:
 
 ```bash
-OK work pipe=ok state=running cell=a1b2c3d4e5f6 next='k poll work a1b2c3d4e5f6 or k int work'
+k run work "import subprocess; subprocess.run(['git', 'status'])"
 ```
 
-`k history` shows the last few results without switching to the terminal:
+For larger code, write a Python file and load it into the live session:
 
 ```bash
-k history work          # last 25 lines (5 cells × 5 lines)
-k history -n 2 work     # last 10 lines (2 cells × 5 lines)
+cat > /tmp/agent_tty_task.py << 'PY'
+import subprocess
+result = subprocess.run(["git", "status"], text=True, capture_output=True)
+print(result.stdout)
+PY
+
+k run work "exec(open('/tmp/agent_tty_task.py').read())"
 ```
 
-Useful as a quick glance — the terminal is the full picture, but sometimes you
-just want to see the last couple of outputs inline.
+## REPL Patterns
 
-## Frame Detection
+Because the session is a Python REPL, ordinary Python patterns become agent
+operations:
 
-Three modes via `--prompt`:
+- Prefix tax: import what you use once, then call shorter names in later cells.
+- Print tax: expression results display automatically; the last expression does
+  not need `print()`.
+- Hot reload: use `exec(open("module.py").read())` or `importlib.reload(m)` to
+  update code without losing process state.
+- Incremental execution: split a long script into cells. If step 3 fails, fix
+  step 3; steps 1 and 2 still exist in memory.
+- Catch, fix, retry: read the traceback, patch a function, and run again in the
+  same namespace.
+- Host commands: use `subprocess.run(..., capture_output=True, text=True)` from
+  inside the session when you need the OS.
 
-| --prompt=     | mode   | how                                         |
-| ------------- | ------ | ------------------------------------------- |
-| *(not set)* | repeat | 5 empty Enters → 5 identical lines → done |
-| `"(gdb)"`   | exact  | match prompt string                         |
-| `./hook.py` | hook   | stdin lines → hook exit → done            |
-
-Hook protocol: k feeds ANSI-stripped, whitespace-stripped lines to stdin. Hook exit = frame done; the line that triggered the exit is treated as the frame boundary and removed from output. Hook paths must include a path separator (`/`). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
-
-## How It Works
-
-```
-k fire "echo hello"
-  |
-  +-- acquires lock (rejected fire = zero side effects)
-  +-- sends code via paste-buffer (atomic)
-      bash multiline: writes 0600 temp script, sends "source <script>"
-  +-- sends 5 frame Enters (repeat mode only)
-  +-- starts background stream processor
-  |
-  stream processor tails log:
-    ECHOING: skip echo_count lines
-    OUTPUT:  collect lines
-    DONE:    5 identical lines / prompt match / hook exit
-  |
-  writes result file -> exits
-  |
-k poll
-  +-- checks result file (O(1))
-  +-- returns JSON
-```
-
-## Safety
-
-| invariant                | mechanism                                                                                                   |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| one cell per session     | O_EXCL lock, acquired before send                                                                           |
-| timeout keeps lock       | lock marked `timed_out`; subsequent polls say `use k int or k kill`                                     |
-| completed-cell recovery  | bg watcher marks `completed`; next fire/run can clear a done-lock without losing the result file           |
-| orphan recovery          | bg process group in lock, poll checks `os.killpg(pgid, 0)` (POSIX)                                        |
-| no line-wrap skew        | tmux width 10000                                                                                            |
-| atomic send              | per-session named paste-buffer `k_{session}`                                                              |
-| bash multiline state     | private per-cell script + `source`, so cd/env/functions persist without interleaved prompt echoes          |
-| ctrl-c safe              | kills watcher, writes `{"status": "error", "output": "interrupted"}`, re-sends frame enters (repeat only) |
-| session name validation  | `[A-Za-z0-9_.-]+`, no `..`, no path traversal                                                           |
-| idempotent pipe restart  | pipe-pane replaced on every fire/run                                                                        |
-| atomic result writes     | tmp + fsync +`os.replace` — poll never reads partial JSON                                                |
-| no output classification | "done" = prompt appeared, not success                                                                       |
+The REPL is Turing complete. File watchers, completion callbacks, local
+monitors, proxy servers, and control loops do not need to be built into
+agent-tty; the session can build them as Python code.
 
 ## Output Formats
 
-Each command has a fixed output format — JSON or text, never mixed:
+Each command has a fixed output style:
 
-| Command | Format | Shape |
-|---------|--------|-------|
-| `k new` | text | `OK <session>` or `ERR ...` |
+| command | format | shape |
+| --- | --- | --- |
+| `k daemon` | process | foreground daemon; startup line on stderr |
+| `k new` | text | `OK <name> pid=<pid> ...` or `ERR ...` |
+| `k int` | text | `OK interrupted <name> (N cells)` or `ERR ...` |
+| `k kill` | text | `OK killed <name>` or `ERR ...` |
+| `k ls` | text | one line per session, or `(no sessions)` |
+| `k run` | raw text | captured stdout/stderr from the cell |
 | `k fire` | JSON | `{"cell_id":"...","status":"fired"}` |
-| `k poll` | JSON | cell result; status = running/done/timeout/error |
-| `k run -j` | JSON | same as poll result |
-| `k run` (no -j) | text | raw command output |
-| `k int` | text | `OK` or `ERR ...` |
-| `k kill` | text | `OK killed <session>` |
-| `k ls` | text | session names, one per line |
-| `k status` | text | `OK <session> pipe=ok state=<state> next='...'` |
-| `k notify` | text | `OK notified: <message>` |
-| `k watch` | text | streaming filtered log lines |
-| `k history` | text | last N×5 filtered log lines |
-| `km` | JSON lines | event object; always session/status/ts, cell_id only for cell events |
+| `k poll` | JSON | `{"cell_id":"...","status":"running|done|error","output":"..."}` |
+| `k status` | JSON | `{"state":"idle|running","running":[],"vars":N,"cells":N}` |
+| `k vars` | JSON | `{"vars":["name", ...]}` |
+| `k complete` | JSON | `{"matches":["os.path", ...]}` |
+| `k attach` | stream | interactive console |
+| `k --version` | text | `agent-tty 0.2.0`; aliases: `k -V`, `k version` |
 
-`k fire`, `k poll`, and `k run -j` always return JSON — parseable by the agent.
-`k run` without `-j` returns raw text — for human-readable output.
-`km` events include `session` and `ts` fields that `k` outputs do not.
+`k run` prints expression results like a Python REPL: strings print as raw text;
+other values use `repr`.
 
-### JSON shapes (k)
-
-```
-fired:        {"cell_id": "...", "status": "fired"}
-running:      {"cell_id": "...", "status": "running"}
-done:         {"cell_id": "...", "status": "done", "output": "..."}
-timeout:      {"cell_id": "...", "status": "timeout", "output": ""}
-timeout(2+):  {"cell_id": "...", "status": "timeout", "output": "use k int or k kill"}
-error:        {"status": "error", "output": "..."}
-cell error:   {"cell_id": "...", "status": "error", "output": "..."}
-```
-
-JSON errors without `cell_id`: `no session 'x'; use k new x bash`, `active cell '{id}'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`, `invalid cell_id`.
-JSON errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `result missing`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
-Text-only errors: `no session found; use k ls or k new <session> bash`, `no log for 'x'; use k status x`, `watcher kill failed; use k kill`.
-
-## Metadata on Disk
-
-```
-$XDG_RUNTIME_DIR/k_cells/<session>/    (or /tmp/k_cells_<uid>/<session>/)
-  _session.json       {name} or {name, prompt}
-  _lock.json          {cell_id, log_offset, echo_count, bg_pgid, completed?, timed_out?, timeout_polled?, terminal_status?}
-  _output.log         pipe-pane stream (append-only)
-  <cell_id>_result.json  stream processor output (deleted after poll)
-```
-
-## Known Limitations
-
-agent-tty is POSIX-only: it requires tmux, tail, and POSIX process signals.
-WSL is fine; native Windows fails fast.
-
-**Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
-
-The `source`/`exec` workflow avoids shell-quoting problems and the multiline-send
-edge cases that can confuse frame detection: the command sent to `k` is always a
-single simple line, while the real code loads inside the live session.
-Repeat-mode frame collision from command *output* (5+ identical non-empty lines)
-is a separate limitation that still applies regardless of how code is sent.
-
-**echo_count heuristic**: generic REPL mode assumes 1 sent line = 1 echoed line. Bash multiline cells avoid this by sourcing a private per-cell script; other REPLs still rely on prompt filtering or hook/exact prompt mode.
-
-**Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
-
-**Line-protocol REPLs only — not TUIs**: agent-tty works with *line-protocol*
-REPLs: programs that emit mostly clean text with stable prompts (`>>> `,
-`sqlite> `, `$ `). bash, python3 -i (classic), sqlite3, and node all work this
-way.
-
-TUIs (text user interfaces) are a fundamentally different category. Programs like
-vim, htop, less — and, in practice, IPython and Python 3.13+'s `_pyrepl` — paint
-the screen with cursor-positioning sequences, color codes, and full redraws.
-They are designed for human eyes, not programmatic consumption. k reads
-`pipe-pane`, which delivers the raw terminal control stream, not the rendered
-screen. A single IPython prompt redraw looks like this in the stream:
-
-```
-^[[?25l^[[?7l^[[8D^[[0m^[[J^[[0;32mIn [^[[0;92;1m4^[[0;32m]: ...
-```
-
-Cursor hides, resets, redraws the prompt in color, moves the cursor back and
-forth, then does the whole thing again. One empty Enter redraws the prompt twice.
-After ANSI stripping you get `In [4]: In [4]:` — doubled prompts, phantom lines,
-broken framing. The assumption that "output is text lines separated by newlines"
-is false; `pipe-pane` delivers VT100 draw instructions, not text. This is an
-impedance mismatch — not a bug to fix, but a category error to avoid.
-
-`PYTHON_BASIC_REPL=1` switches Python 3.13+ back to the classic line-protocol
-REPL. For agent work surfaces, always prefer line-protocol REPLs:
+Assignments usually produce no output:
 
 ```bash
-k new py python3 -i                          # Python 3.12 and below (already line-protocol)
-k new py "env PYTHON_BASIC_REPL=1 python3 -i" # Python 3.13+ (switch back to line-protocol)
-# avoid: k new py ipython                     # TUI — unreliable framing
+k run work "x = 1"
+# empty output
 ```
 
-## km — callback monitor
-
-`km` wakes your agent when a long cell finishes. It tails the session log and
-emits one JSON event per line to stdout — no polling, no sleep loops.
-
-Works with any agent host that has background-notification support: Claude
-Code's Monitor tool, Codex App Server via `vendor/codex_bridge.py`, or a
-plain subprocess reader.
-
-```
-km <session> [cell_id] [-1]
-```
-
-`-1` exits after first completion — one-shot `.then()` for agent orchestration.
-With a cell_id, it waits for that specific cell. Without one, it pre-scans the
-log and returns the most recent completion — useful as a "did anything finish?"
-query, but be aware it may return an older cell (e.g. one that was interrupted)
-if nothing new has completed.
-
-### Why km after k
-
-`k` is the agent's stateful terminal. `km` is the callback channel for
-long-running cells. Background task support alone is not enough when process
-state matters; `km` lets the persistent TTY keep running and wakes the agent
-when a cell finishes. `k poll` works for simple scripts, but poll loops waste
-tokens and add latency:
+Expressions print:
 
 ```bash
-# poll loop: agent burns a tool call every N seconds
-# k poll → "running" → k poll → "running" → k poll → "done"
-
-# km: one tool call, block until done
-km work -1
-# {"cell_id": "...", "session": "work", "status": "done", "ts": "..."}
+k run work "x + 1"
+# 2
 ```
 
-With `km -1`, the agent fires a long task, starts the monitor in the
-background, and gets woken exactly once on completion. Zero wasted calls.
+## Async Cells
 
-### Continuous mode
-
-Without `-1`, `km` runs indefinitely — every event streams as a JSON line.
-Useful for multi-cell orchestration where your agent reacts to each
-completion in sequence.
-
-### Codex bridge (experimental)
-
-`vendor/codex_bridge.py` is a local experiment for hosts that expose Codex App Server.
-It reads `km` stdout, polls completed cells with `k poll`, and starts a visible
-Codex turn with `turn/start` when the target thread is idle. If the thread is
-already active, events are queued and batched into one visible turn after the
-thread becomes idle. That makes the event visible as a normal Codex turn instead
-of hiding it in prompt history.
-
-Important caveat from local testing on 2026-06-20: Codex App Server does not
-expose a single Monitor-like primitive. `thread/inject_items` persists data for
-later turns but does not wake an agent; `turn/steer` needs an active turn and
-expected turn id; `turn/interrupt` stops work but does not carry payload; and
-`turn/start` wakes an idle thread but can create a parallel side turn if another
-turn is still active. The bridge owns that state machine.
-
-Codex Desktop may also fail to live-refresh turns started by another app-server
-client. Treat this bridge as better suited to headless/remote automation and
-external sinks such as tmux, a web UI, or email. It is not a guarantee that the
-Desktop UI will update in real time.
+`fire` starts a background cell and returns immediately. Cells inside one
+session execute serially under the session lock. Create multiple sessions for
+parallel work.
 
 ```bash
-# find candidates first
-python vendor/codex_bridge.py --list-threads --thread-cwd . --thread-search "agent tty"
-python vendor/codex_bridge.py --list-loaded
-
-# run the bridge daemon
-python vendor/codex_bridge.py --session work --thread-id THREAD_ID
+k new a
+k new b
+k fire a "import time; time.sleep(5); result = 'A'"
+k fire b "import time; time.sleep(5); result = 'B'"
 ```
 
-The bridge is deliberately type-sealed: km lines must parse into `KmEvent`,
-thread ids must become `ThreadHandle`, thread runtime must become
-`ThreadRuntimeStatus`, idle delivery must become `IdleThread`, and visible
-`turn/start` calls only accept an `IdleThread` plus an `EventPrompt` derived
-from a validated event and optional `PollResult`. The static check is
-`python tests/test_bridge_contracts.py`.
+`poll` with a cell id returns that cell. `poll` without a cell id returns the
+most recent cell in the session, or `{"status":"idle"}` if no cells exist.
 
-### Events
+## Transport
 
-```
-fired:       {"cell_id": "...", "session": "...", "status": "fired",       "ts": "..."}
-done:        {"cell_id": "...", "session": "...", "status": "done",        "ts": "..."}
-timeout:     {"cell_id": "...", "session": "...", "status": "timeout",     "ts": "..."}
-interrupted: {"cell_id": "...", "session": "...", "status": "interrupted", "ts": "..."}
-notify:      {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
-closed:      {"session": "...", "status": "closed", "ts": "..."}
-error:       {"session": "...", "status": "error",  "message": "...", "ts": "..."}
+AF_UNIX mode uses `K_SOCK`, defaulting to `/tmp/k.sock`.
+
+TCP mode uses `127.0.0.1:K_PORT` (default 7399) and requires `K_TOKEN`. Native
+Windows uses TCP mode. The daemon prints the token on startup:
+
+```text
+k daemon pid=12345 127.0.0.1:7399 mode=winpty token=abc123...
+set K_TOKEN=abc123...
 ```
 
-## Testing
+On Linux/macOS (when using TCP explicitly):
+
+```text
+export K_TOKEN=abc123...
+```
+
+Attach uses the same token in TCP mode, so the `k attach` client or `k.py`
+wrapper must have `K_TOKEN` set.
+
+Use `k.py.template` to make TCP commands short:
 
 ```bash
-python tests/test_contracts.py      # static code contracts, no tmux
-python tests/test_bridge_contracts.py # Codex bridge type-seal contracts, no app-server
-python tests/test_docs.py           # docs/package drift, no tmux
-python -m mypy --platform linux src vendor tests # POSIX type surface
-bash tests/test.sh                  # 67 tests (65 without gdb), runtime smoke suite
-python tests/test_regressions.py    # targeted audit regressions
-python tests/run_all.py             # all suites
+cp k.py.template k.py
+# paste K_TOKEN and K_PORT into k.py
+python k.py ls
+python k.py new work
 ```
 
-## Files
+`k.py` is listed in `.gitignore` because it contains a live local daemon token.
 
+On Windows, WinPTY mode requires `pywinpty`. With `pywinpty` available the daemon
+prints `mode=winpty`; otherwise it falls back to `mode=socket`.
+
+## Tests
+
+Static syntax check:
+
+```bash
+python -B -m py_compile agent_tty.py k.py.template tests/test_pty_posix.py tests/test_tcp_windows.py
 ```
-src/agent_tty/cli.py       k — main script
-src/agent_tty/monitor.py   km — event monitor
-scripts/k, scripts/km      dev shims (no pip install needed)
-vendor/codex_bridge.py     experimental km → Codex App Server bridge
-pyproject.toml             pip install agent-tty → agent-tty, k, km in PATH
-man/agent-tty.1            man page source
-tests/test.sh              runtime smoke suite
-tests/*.py                 static, docs, and regression suites
-SKILL.md                   agent reference
-EXAMPLES.md                patterns + philosophy
+
+POSIX PTY regression suite:
+
+```bash
+python3 -B tests/test_pty_posix.py
 ```
+
+The POSIX suite starts a daemon with a Unix socket, creates a PTY session, and
+checks `new`, `ls`, `run`, `fire`, `poll`, `status`, `complete`, and `kill`.
+
+Windows TCP regression suite:
+
+```powershell
+python -B tests/test_tcp_windows.py
+```
+
+The Windows suite starts a daemon on loopback TCP, reads the daemon token from
+stderr, sets `K_TOKEN`/`K_PORT`, then exercises the real CLI client path. It
+works with WinPTY when `pywinpty` is installed and with socket-console fallback
+otherwise.

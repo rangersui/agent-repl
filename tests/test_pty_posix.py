@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT_TTY = ROOT / "agent-tty.py"
+AGENT_TTY = ROOT / "agent_tty.py"
 
 PASS = 0
 FAIL = 0
@@ -165,7 +165,7 @@ def main():
 
             # -- worker is owned by the daemon process tree --
             resp = send_cmd(sock_path, "run", ["test1", "os.getppid()"])
-            check("worker-not-daemon-child",
+            check("worker-daemon-parent",
                   str(daemon.pid) if sys.platform != "win32" else "",
                   resp)
 

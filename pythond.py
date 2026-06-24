@@ -336,6 +336,7 @@ def _access_log(
         fields.append(f"detail={detail}")
     line = " ".join(fields) + "\n"
     try:
+        # open-write-close per line: intentional, crash-safe, standard for access logs
         path = os.path.join(_runtime_dir(), "access.log")
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
@@ -2756,6 +2757,24 @@ def _handle_kill(args: list[str]) -> str:
     return f"ERR no session '{name}'"
 
 
+def _resize_session_locked(s: JsonDict, rows: int, cols: int) -> str:
+    """Resize a PTY session. Caller holds the per-session command lock."""
+    if s["type"] == "remote":
+        return "ERR resize not supported for remote sessions"
+    if s["type"] == "pty" and "winpty" in s:
+        s["winpty"].setwinsize(rows, cols)
+    elif s["type"] == "pty" and s.get("master_fd") is not None:
+        import struct
+        fcntl.ioctl(  # type: ignore[name-defined]
+            s["master_fd"],
+            termios.TIOCSWINSZ,  # type: ignore[name-defined]
+            struct.pack("HHHH", rows, cols, 0, 0),
+        )
+    else:
+        return "ERR session has no live PTY"
+    return "OK"
+
+
 def _handle_resize(args: list[str]) -> str:
     if len(args) != 3:
         return "ERR usage: resize <name> <rows> <cols>"
@@ -2768,23 +2787,10 @@ def _handle_resize(args: list[str]) -> str:
     s = _get_session(name)
     if s is None:
         return f"ERR no session '{name}'"
-    if s["type"] == "remote":
-        return "ERR resize not supported for remote sessions"
     with _session_lock(s):
         if _get_session(name) is not s:
             return f"ERR no session '{name}'"
-        if s["type"] == "pty" and "winpty" in s:
-            s["winpty"].setwinsize(rows, cols)
-        elif s["type"] == "pty" and s.get("master_fd") is not None:
-            import struct
-            fcntl.ioctl(  # type: ignore[name-defined]
-                s["master_fd"],
-                termios.TIOCSWINSZ,  # type: ignore[name-defined]
-                struct.pack("HHHH", rows, cols, 0, 0),
-            )
-        else:
-            return "ERR session has no live PTY"
-    return "OK"
+        return _resize_session_locked(s, rows, cols)
 
 
 def _handle_ls(args: list[str]) -> str:
@@ -2816,7 +2822,7 @@ def _log_cell_launch(name: str, src: str, resp: JsonDict) -> None:
     if cid:
         current = _get_session(name)
         if current is not None:
-            current.setdefault("_async_src", {})[cid] = src
+            current.setdefault("_async_src", {})[cid] = src  # safe: setdefault is atomic under GIL, cids are unique
 
 
 def _log_cell_poll(name: str, resp: JsonDict, exec_error: bool) -> None:
@@ -3054,7 +3060,15 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                             ws.send(f"ERR session '{aname}' has no PTY")
                             continue
                         if len(args) >= 3:
-                            resize_resp = _handle_resize([aname, args[1], args[2]])
+                            try:
+                                rows, cols = int(args[1]), int(args[2])
+                            except ValueError:
+                                resize_resp = "ERR rows/cols must be integers"
+                            else:
+                                if not (1 <= rows <= 65535 and 1 <= cols <= 65535):
+                                    resize_resp = "ERR rows/cols out of range"
+                                else:
+                                    resize_resp = _resize_session_locked(s, rows, cols)
                             if resize_resp != "OK":
                                 _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
                                             status="resize-failed")
@@ -3461,6 +3475,7 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> bool:
     )
 
     def read_input(stopped: threading.Event) -> bytes | None:
+        # Windows console stdin doesn't support select(); poll with kbhit()
         if not msvcrt.kbhit():
             time.sleep(0.01)
             return None

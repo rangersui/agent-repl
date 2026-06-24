@@ -1569,7 +1569,8 @@ def test_connection_hardening_static():
           "_send(\"resize\"" not in attach_seg and
           "cols, rows = os.get_terminal_size()" in attach_seg and
           "attach {name}{resize_args}" in attach_seg and
-          "_handle_resize([aname, args[1], args[2]])" in daemon_seg)
+          "_handle_resize([aname, args[1], args[2]])" not in daemon_seg and
+          "_resize_session_locked(s, rows, cols)" in daemon_seg)
     check("attach errors use public message",
           "_public_error(e)" in attach_seg)
     check("send uses shared daemon connector", "_connect_daemon(" in send_seg)
@@ -1866,7 +1867,7 @@ def test_connection_hardening_static():
     check("manual help strings removed",
           "_PYSH_HELP" not in src and "_PYCTL_HELP" not in src)
     check("remote resize fails explicitly",
-          "resize not supported for remote sessions" in resize_seg)
+          "resize not supported for remote sessions" in src)
     check("parse_host_port rejects empty host",
           "if not host:" in parse_host_port_seg)
     check("attach reader uses bounded recv",
@@ -2798,7 +2799,7 @@ def test_integration_ws_attach():
 
         # attach via WebSocket
         ws2 = unix_connect(sock, open_timeout=3, subprotocols=[_WS_PROTO])
-        ws2.send("attach ptytest")
+        ws2.send("attach ptytest 24 80")
         resp = ws2.recv(timeout=3)
         check("attach OK", resp.startswith("OK"), resp)
 

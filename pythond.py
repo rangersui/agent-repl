@@ -687,6 +687,84 @@ def _cert_fingerprint(cert_path: str) -> str:
     except (OSError, ValueError):
         return "unknown"
 
+def _cert_fingerprint_der(der: bytes) -> str:
+    """Return colon-separated SHA-256 fingerprint for DER certificate bytes."""
+    digest = _hashlib.sha256(der).hexdigest().upper()
+    return ":".join(digest[i:i+2] for i in range(0, len(digest), 2))
+
+def _normalise_fingerprint(value: str) -> str:
+    """Normalise a stored fingerprint to colon-separated uppercase hex."""
+    raw = re.sub(r"[^0-9A-Fa-f]", "", value)
+    if len(raw) != 64:
+        return ""
+    raw = raw.upper()
+    return ":".join(raw[i:i+2] for i in range(0, len(raw), 2))
+
+def _cert_ca_capable(cert_path: str) -> bool:
+    """Return True when a cert can act as a CA or cannot be inspected."""
+    if not _HAS_CRYPTO:
+        return True
+    try:
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        try:
+            basic = cert.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            ).value
+            if basic.ca:
+                return True
+        except x509.ExtensionNotFound:
+            pass
+        try:
+            usage = cert.extensions.get_extension_for_class(
+                x509.KeyUsage
+            ).value
+            if usage.key_cert_sign or usage.crl_sign:
+                return True
+        except x509.ExtensionNotFound:
+            pass
+        return False
+    except (OSError, ValueError):
+        return True
+
+def _trusted_fingerprints(directory: str) -> set[str]:
+    """Load trusted exact peer certificate fingerprints from a directory."""
+    trusted: set[str] = set()
+    for filename in os.listdir(directory):
+        path = os.path.join(directory, filename)
+        if filename.endswith(".pem"):
+            if _cert_ca_capable(path):
+                print(f"warn: skipping CA-capable cert {filename}", file=sys.stderr)
+                continue
+            fp = _cert_fingerprint(path)
+        else:
+            try:
+                with open(path, encoding="ascii") as f:
+                    fp = _normalise_fingerprint(f.read().strip().split()[0])
+            except (IndexError, OSError, UnicodeDecodeError):
+                fp = ""
+        if fp and fp != "unknown":
+            trusted.add(fp)
+    return trusted
+
+def _verify_peer_fingerprint(
+    sock: SocketLike,
+    directory: str,
+    role: str,
+) -> str:
+    """Verify peer cert fingerprint exactly; return fingerprint or raise."""
+    trusted = _trusted_fingerprints(directory)
+    if not trusted:
+        raise RuntimeError(f"no trusted {role} fingerprints")
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        raise RuntimeError(f"missing {role} certificate")
+    fp = _cert_fingerprint_der(der)
+    for expected in trusted:
+        if hmac.compare_digest(fp, expected):
+            return fp
+    raise RuntimeError(f"untrusted {role} certificate fingerprint")
+
 def _trusted_clients_dir() -> str:
     """Return ~/.pythond/tls/trusted_clients/ -- server trusts these clients."""
     return _ensure_private_dir(os.path.join(_tls_dir(), "trusted_clients"))
@@ -696,12 +774,16 @@ def _trusted_servers_dir() -> str:
     return _ensure_private_dir(os.path.join(_tls_dir(), "trusted_servers"))
 
 def _load_trusted_certs(ssl_ctx: _ssl.SSLContext, directory: str) -> int:
-    """Load all .pem certs from a directory into SSLContext. Returns count."""
+    """Load non-CA PEMs for TLS client-cert handshakes. Returns count."""
     count = 0
     for f in os.listdir(directory):
         if f.endswith(".pem"):
+            cert_path = os.path.join(directory, f)
+            if _cert_ca_capable(cert_path):
+                print(f"warn: skipping CA-capable cert {f}", file=sys.stderr)
+                continue
             try:
-                ssl_ctx.load_verify_locations(os.path.join(directory, f))
+                ssl_ctx.load_verify_locations(cert_path)
                 count += 1
             except (_ssl.SSLError, OSError):
                 print(f"warn: skipping malformed cert {f}", file=sys.stderr)
@@ -713,14 +795,28 @@ def trust_cert(cert_path: str, direction: str = "client") -> tuple[str, str]:
     direction="client" -> server trusts this client (pyctl trust)
     direction="server" -> client trusts this server (pyctl pin)
     """
+    if direction not in ("client", "server"):
+        raise ValueError("direction must be 'client' or 'server'")
     td = _trusted_clients_dir() if direction == "client" else _trusted_servers_dir()
     fp = _cert_fingerprint(cert_path)
     if fp == "unknown":
         raise RuntimeError("invalid certificate")
+    if _cert_ca_capable(cert_path):
+        raise RuntimeError("refusing CA-capable certificate")
     name = fp.replace(":", "")[:16] + ".pem"
     dest = os.path.join(td, name)
+    fp_dest = os.path.join(td, name + ".fingerprint")
     import shutil
     shutil.copy2(cert_path, dest)
+    fd = os.open(fp_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                 0o600 if sys.platform != "win32" else 0o666)
+    try:
+        os.write(fd, (fp + "\n").encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if sys.platform != "win32":
+        os.chmod(fp_dest, 0o600)
     return dest, fp
 
 
@@ -752,9 +848,11 @@ class _TlsTerminatedServer:
         port: int,
         ssl_ctx: _ssl.SSLContext,
         subprotocols: list[str],
+        trusted_client_dir: str | None = None,
     ) -> None:
         self._stopped = threading.Event()
         self._ssl_ctx = ssl_ctx
+        self._trusted_client_dir = trusted_client_dir
         self._inner = ws_serve(handler, "127.0.0.1", 0,
                                subprotocols=subprotocols)
         try:
@@ -810,6 +908,9 @@ class _TlsTerminatedServer:
         inner_sock = None
         try:
             tls_sock = self._ssl_ctx.wrap_socket(raw, server_side=True)
+            if self._trusted_client_dir is not None:
+                _verify_peer_fingerprint(tls_sock, self._trusted_client_dir,
+                                         "client")
             inner_sock = socket.create_connection(("127.0.0.1",
                                                    self._inner_port))
             self._bridge(tls_sock, inner_sock)
@@ -965,18 +1066,26 @@ def _make_exec(
     on_done(src, output), when provided, broadcasts completed AI cells to an
     attached human REPL.
     """
-    # install thread-local stdout/stderr once per session
-    if not isinstance(sys.stdout, _ThreadStdout):
-        sys.stdout = _ThreadStdout(sys.stdout)
-    if not isinstance(sys.stderr, _ThreadStdout):
-        sys.stderr = _ThreadStdout(sys.stderr)
+    # Keep stable wrappers; user code can assign sys.stdout/sys.stderr.
+    stdout_wrapper = (
+        sys.stdout if isinstance(sys.stdout, _ThreadStdout)
+        else _ThreadStdout(sys.stdout)
+    )
+    stderr_wrapper = (
+        sys.stderr if isinstance(sys.stderr, _ThreadStdout)
+        else _ThreadStdout(sys.stderr)
+    )
+    sys.stdout = stdout_wrapper
+    sys.stderr = stderr_wrapper
 
     def _exec(src: str) -> _ExecOutput:
         with lock:
             buf = io.StringIO()
             had_error = False
-            stdout = typing.cast(_ThreadStdout, sys.stdout)
-            stderr = typing.cast(_ThreadStdout, sys.stderr)
+            sys.stdout = stdout_wrapper
+            sys.stderr = stderr_wrapper
+            stdout = stdout_wrapper
+            stderr = stderr_wrapper
             stdout._local.buf = buf
             stderr._local.buf = buf
             try:
@@ -994,6 +1103,8 @@ def _make_exec(
             finally:
                 stdout._local.buf = None
                 stderr._local.buf = None
+                sys.stdout = stdout_wrapper
+                sys.stderr = stderr_wrapper
             output = buf.getvalue().rstrip()
             result = _ExecOutput(output, had_error)
         if on_done:
@@ -1223,38 +1334,41 @@ def _dispatch(
                 os.waitpid(pid, 0)
             except ChildProcessError:
                 pass  # already reaped
-            r["pid"] = None
+            output = ""
+            had_error = False
+            merged_keys: list[str] = []
+            skipped: list[str] = []
             try:
                 if chunks:
                     data = pickle.loads(b"".join(chunks))
-                    r["output"] = data.get("output", "")
-                    r["_error"] = bool(data.get("_error", False))
+                    output = data.get("output", "")
+                    had_error = bool(data.get("_error", False))
                     merged = data.get("diff", {})
-                    if r["_error"]:
+                    if had_error:
                         merged = {}
                     else:
                         with _locked(lock):
                             ns.update(merged)
-                    r["_merged"] = list(merged.keys())
-                    r["_skipped"] = data.get("skipped", [])
+                    merged_keys = list(merged.keys())
+                    skipped = data.get("skipped", [])
                 else:
-                    r["output"] = "(killed)"
-                    r["_error"] = True
-                    r["_merged"] = []
-                    r["_skipped"] = []
+                    output = "(killed)"
+                    had_error = True
             except (EOFError, OSError, pickle.UnpicklingError):
-                r["output"] = r.get("output", "") or "(killed)"
-                r["_error"] = True
-                r["_merged"] = []
-                r["_skipped"] = []
+                output = r.get("output", "") or "(killed)"
+                had_error = True
             except Exception:
-                r["output"] = r.get("output", "") or "(fork result read failed)"
-                r["_error"] = True
-                r["_merged"] = []
-                r["_skipped"] = []
+                output = r.get("output", "") or "(fork result read failed)"
+                had_error = True
             finally:
-                r["status"] = "done"
-                r["_done_at"] = time.time()
+                with _cells_lock:
+                    r["pid"] = None
+                    r["output"] = output
+                    r["_error"] = had_error
+                    r["_merged"] = merged_keys
+                    r["_skipped"] = skipped
+                    r["status"] = "done"
+                    r["_done_at"] = time.time()
         with _cells_lock:
             cells[cid] = res
             _evict_stale_cells(cells)
@@ -1513,44 +1627,95 @@ class PtyBridge:
         self._read = pty_read
         self._write = pty_write
         self._send_fn: typing.Callable[[bytes], typing.Any] | None = None
+        self._close_fn: typing.Callable[[], typing.Any] | None = None
         self._owner: object | None = None
         self._lock = threading.Lock()
         self._scrollback = bytearray()
         self._MAX = _BUFFER_CHUNK
         threading.Thread(target=self._reader, daemon=True).start()
 
-    def attach(self, send_fn: typing.Callable[[bytes], typing.Any]) -> object | None:
+    def attach(
+        self,
+        send_fn: typing.Callable[[bytes], typing.Any],
+        close_fn: typing.Callable[[], typing.Any] | None = None,
+    ) -> object | None:
         """Attach one client. send_fn(bytes) sends binary data to client."""
+        scrollback = b""
         with self._lock:
             if self._send_fn is not None:
                 return None
             owner = object()
             self._send_fn = send_fn
+            self._close_fn = close_fn
             self._owner = owner
             if self._scrollback:
-                try:
-                    send_fn(bytes(self._scrollback))
-                except Exception:
-                    self._send_fn = None
-                    self._owner = None
-                    return None
+                scrollback = bytes(self._scrollback)
                 self._scrollback.clear()
-            return owner
+        if scrollback:
+            try:
+                send_fn(scrollback)
+            except Exception:
+                with self._lock:
+                    if self._owner is owner:
+                        self._send_fn = None
+                        self._close_fn = None
+                        self._owner = None
+                        self._buffer_scrollback_front_locked(scrollback)
+                return None
+        return owner
+
+    def _take_close_fn_locked(
+        self,
+        owner: object | None = None,
+    ) -> typing.Callable[[], typing.Any] | None:
+        """Clear current attachment and return its close callback."""
+        if owner is not None and self._owner is not owner:
+            return None
+        close_fn = self._close_fn
+        self._send_fn = None
+        self._close_fn = None
+        self._owner = None
+        return close_fn
+
+    def _call_close_fn(self, close_fn: typing.Callable[[], typing.Any] | None) -> None:
+        """Best-effort close notification for attached WebSocket clients."""
+        if close_fn is None:
+            return
+        try:
+            close_fn()
+        except Exception as e:
+            print(f"WARN: PTY attach close callback failed: {e.__class__.__name__}",
+                  file=sys.stderr)
+
+    def _close_attached_client(self) -> None:
+        """Detach and actively wake the currently attached client."""
+        with self._lock:
+            close_fn = self._take_close_fn_locked()
+        self._call_close_fn(close_fn)
+
+    def _buffer_scrollback_locked(self, data: bytes) -> None:
+        """Append to bounded scrollback. Caller holds _lock."""
+        self._scrollback.extend(data)
+        if len(self._scrollback) > self._MAX:
+            del self._scrollback[:-self._MAX]
+
+    def _buffer_scrollback_front_locked(self, data: bytes) -> None:
+        """Prepend failed attach scrollback. Caller holds _lock."""
+        self._scrollback[:0] = data[-self._MAX:]
+        if len(self._scrollback) > self._MAX:
+            del self._scrollback[:-self._MAX]
 
     def detach(self, owner: object | None = None) -> None:
         """Detach current client. PTY output goes to scrollback buffer."""
         with self._lock:
-            if owner is not None and self._owner is not owner:
-                return
-            self._send_fn = None
-            self._owner = None
+            self._take_close_fn_locked(owner)
 
     def close(self) -> None:
         """Drop any attached client and buffered PTY output during session kill."""
         with self._lock:
-            self._send_fn = None
-            self._owner = None
+            close_fn = self._take_close_fn_locked()
             self._scrollback.clear()
+        self._call_close_fn(close_fn)
 
     def write(self, data: bytes) -> None:
         """Client -> PTY input."""
@@ -1570,26 +1735,18 @@ class PtyBridge:
                 if self._send_fn:
                     send_fn = self._send_fn
                 else:
-                    self._scrollback.extend(data)
-                    if len(self._scrollback) > self._MAX:
-                        del self._scrollback[:-self._MAX]
+                    self._buffer_scrollback_locked(data)
             if send_fn is not None:
                 try:
                     send_fn(data)
                 except Exception:
+                    close_fn = None
                     with self._lock:
-                        self._scrollback.extend(data)
-                        if len(self._scrollback) > self._MAX:
-                            del self._scrollback[:-self._MAX]
+                        self._buffer_scrollback_locked(data)
                         if self._send_fn is send_fn:
-                            self._send_fn = None
-                            self._owner = None
-                else:
-                    with self._lock:
-                        if self._send_fn is not send_fn:
-                            self._scrollback.extend(data)
-                            if len(self._scrollback) > self._MAX:
-                                del self._scrollback[:-self._MAX]
+                            close_fn = self._take_close_fn_locked()
+                    self._call_close_fn(close_fn)
+        self._close_attached_client()
 
 def new_session(name: str) -> None:
     """Create or replace one named Python session."""
@@ -1889,20 +2046,16 @@ def _client_ssl_ctx() -> _ssl.SSLContext:
     """Create TLS client context with directional trust.
 
     Loads client cert for mTLS (proving identity to server).
-    Loads trusted_servers/ certs for server verification.
-    Fails closed: if no pinned server certs and no system CA can verify,
-    the connection will be rejected.  Use `pyctl pin <cert.pem>` to trust
-    a self-signed remote daemon, or install a CA-signed cert on the server.
+    Uses trusted_servers/ fingerprints for exact server verification.
+    If no server pins exist, falls back to the system CA bundle.
     """
     ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
-    # load pinned server certs if available
-    n = _load_trusted_certs(ctx, _trusted_servers_dir())
-    if n > 0:
-        # Self-signed pinned daemon certs rarely match DNS names. The pin
-        # itself is the server identity check.
+    # If pins exist, certificate identity is checked after the handshake by
+    # exact SHA-256 fingerprint, not by OpenSSL CA/path validation.
+    if _trusted_fingerprints(_trusted_servers_dir()):
         ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_REQUIRED
+        ctx.verify_mode = _ssl.CERT_NONE
     else:
         # no pinned certs -- fall back to system CA bundle
         ctx.check_hostname = True
@@ -1943,6 +2096,9 @@ class _WsproClient:
         sock = None
         try:
             sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
+            server_trust_dir = _trusted_servers_dir()
+            if _trusted_fingerprints(server_trust_dir):
+                _verify_peer_fingerprint(sock, server_trust_dir, "server")
             sock.settimeout(timeout)
             ws = wsproto.WSConnection(ConnectionType.CLIENT)
             headers: list[tuple[bytes, bytes]] = []
@@ -2542,6 +2698,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
     global _daemon_token, _daemon_server
     _daemon_server = None
     ssl_ctx = None
+    trusted_client_dir = None
 
     # --- resolve address & auth ---
     if listen_addr:
@@ -2574,8 +2731,9 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             # mTLS: if trusted_clients/ has certs -> require client cert in
             # addition to token auth.  The local TLS terminator forwards to an
             # inner loopback WebSocket, so token auth remains mandatory there.
-            n = _load_trusted_certs(ssl_ctx, _trusted_clients_dir())
-            if n > 0:
+            trusted_client_dir = _trusted_clients_dir()
+            n = _load_trusted_certs(ssl_ctx, trusted_client_dir)
+            if _trusted_fingerprints(trusted_client_dir):
                 ssl_ctx.verify_mode = _ssl.CERT_REQUIRED
                 _use_mtls = True
         else:
@@ -2633,9 +2791,9 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 parts = header.split()
                 cmd = parts[0] if parts else ""
                 args = parts[1:]
+                session_name = args[0] if args else ""
                 if has_body:
                     args.append(body)
-                session_name = args[0] if args else ""
                 body_len = len(body.encode("utf-8", "replace")) if has_body else 0
                 _access_log("command", conn_id=conn_id, peer=peer, cmd=cmd,
                             session=session_name, body_bytes=body_len)
@@ -2662,7 +2820,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                                         status="resize-failed")
                             ws.send(resize_resp)
                             continue
-                    owner = bridge.attach(lambda data: ws.send(data))
+                    owner = bridge.attach(lambda data: ws.send(data),
+                                          lambda: ws.close())
                     if owner is None:
                         _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
                                     status="busy")
@@ -2764,7 +2923,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 assert ssl_ctx is not None
                 server = _set_server(
                     _TlsTerminatedServer(ws_serve, _ws_handler, host,
-                                         port, ssl_ctx, [_WS_PROTO])
+                                         port, ssl_ctx, [_WS_PROTO],
+                                         trusted_client_dir if _use_mtls else None)
                 )
             else:
                 server = _set_server(
@@ -3153,7 +3313,7 @@ def main() -> None:
         if not attach(args.name):
             sys.exit(1)
     else:
-        client(args.command, argv[1:])
+        client(args.command, argv[1:], fail_on_err=True)
 
 def pysh_main() -> None:
     """Entry point for `pysh` command -- session commands."""
@@ -3181,7 +3341,7 @@ def pysh_main() -> None:
         if not attach(args.name):
             sys.exit(1)
     else:
-        client(args.command, argv[1:])
+        client(args.command, argv[1:], fail_on_err=True)
 
 def pyctl_main() -> None:
     """Entry point for `pyctl` command -- daemon management."""

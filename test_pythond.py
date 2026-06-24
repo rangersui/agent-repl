@@ -236,6 +236,19 @@ def test_make_exec_thread_isolation():
     check("normal capture works", output2.strip() == "normal")
 
 
+def test_make_exec_restores_replaced_stdio():
+    section("_make_exec restores replaced stdio")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+
+    _exec("import sys, io\nsys.stdout = io.StringIO()\nsys.stderr = io.StringIO()")
+    out = _exec("print('still captured')")
+    check("stdout replacement recovered", out == "still captured", out)
+    check("global stdout wrapper restored", isinstance(sys.stdout, pythond._ThreadStdout))
+    check("global stderr wrapper restored", isinstance(sys.stderr, pythond._ThreadStdout))
+
+
 def test_thread_stdout_compat_methods():
     section("_ThreadStdout compat methods")
     real = io.StringIO()
@@ -708,6 +721,27 @@ def test_cert_generation():
                   pythond._cert_key_pair_valid(cert3, key3))
 
 
+def test_trust_cert_exact_fingerprint_store():
+    section("trust cert exact fingerprint store")
+    if not pythond._HAS_CRYPTO:
+        check("skip (no cryptography)", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(pythond, "_tls_dir", return_value=td):
+            cert, _key = pythond._generate_cert()
+            dest, fp = pythond.trust_cert(cert, direction="server")
+            fp_path = dest + ".fingerprint"
+            check("trusted PEM copied", os.path.exists(dest))
+            check("fingerprint file written", os.path.exists(fp_path))
+            check("trusted fingerprint exact",
+                  fp in pythond._trusted_fingerprints(pythond._trusted_servers_dir()))
+            try:
+                pythond.trust_cert(cert, direction="servers")
+                check("invalid direction rejected", False)
+            except ValueError:
+                check("invalid direction rejected", True)
+
+
 def test_cert_generation_no_crypto():
     section("cert generation without cryptography")
     with mock.patch.object(pythond, "_HAS_CRYPTO", False):
@@ -1063,10 +1097,18 @@ def test_connection_hardening_static():
     check("cert cache validates key pair",
           "_cert_key_pair_valid(cert_path, key_path)" in cert_gen_seg and
           "TLS cert/key mismatch; regenerating" in cert_gen_seg)
+    check("TLS server trust verifies exact fingerprint",
+          "_verify_peer_fingerprint(tls_sock, self._trusted_client_dir" in tls_server_seg)
+    check("TLS client pin verifies exact fingerprint",
+          "_verify_peer_fingerprint(sock, server_trust_dir, \"server\")" in wspro_seg and
+          "ctx.verify_mode = _ssl.CERT_NONE" in src)
     check("cert key validation tolerates missing crypto",
           "except (AttributeError, NameError, OSError, TypeError, ValueError):" in cert_gen_seg)
     check("trusted cert load skips unreadable certs",
           "except (_ssl.SSLError, OSError):" in src)
+    check("trusted certs reject CA-capable certs",
+          "refusing CA-capable certificate" in trust_cert_seg and
+          "skipping CA-capable cert" in src)
     check("cert partial replace is invalidated",
           "for fpath in (tmp_key, tmp_cert, key_path, cert_path):" in cert_gen_seg)
     check("self-signed cert is not a CA",
@@ -1104,17 +1146,18 @@ def test_connection_hardening_static():
           "s[\"winpty\"] = None" in close_session_seg and
           "s[\"proc\"] = None" in close_session_seg)
     check("fork monitor always marks done",
-          "finally:\n                r[\"status\"] = \"done\"" in fork_monitor_seg)
-    check("fork monitor clears pid immediately after waitpid",
+          "with _cells_lock:\n                    r[\"pid\"] = None" in fork_monitor_seg and
+          "r[\"status\"] = \"done\"" in fork_monitor_seg)
+    check("fork monitor clears pid after waitpid under cell lock",
           "os.waitpid(pid, 0)" in fork_monitor_seg and
-          "pass  # already reaped\n            r[\"pid\"] = None" in fork_monitor_seg)
+          "with _cells_lock:\n                    r[\"pid\"] = None" in fork_monitor_seg)
     check("fork monitor clears pid once",
           fork_monitor_seg.count("r[\"pid\"] = None") == 1)
     check("fork monitor handles unexpected result failures",
           "(fork result read failed)" in fork_monitor_seg and
           "except Exception:" in fork_monitor_seg)
     check("failed fork does not merge diff",
-          "if r[\"_error\"]:" in fork_monitor_seg and
+          "if had_error:" in fork_monitor_seg and
           "merged = {}" in fork_monitor_seg)
     check("fork snapshots while locked",
           "lock.acquire()" in dispatch_seg and "child_pid = os.fork()" in dispatch_seg)
@@ -1274,6 +1317,10 @@ def test_connection_hardening_static():
           "conn_id=conn_id" in daemon_full_seg)
     check("daemon command access log omits body content",
           "body_len = len(body.encode" in daemon_full_seg and
+          "session_name = args[0] if args else \"\"" in daemon_full_seg and
+          "args.append(body)" in daemon_full_seg and
+          daemon_full_seg.index("session_name = args[0] if args else \"\"") <
+          daemon_full_seg.index("args.append(body)") and
           "body_bytes=body_len" in daemon_full_seg and
           "detail=body" not in daemon_full_seg)
 
@@ -1293,6 +1340,23 @@ def test_entry_points_exist():
     check("main", callable(pythond.main))
     check("pysh_main", callable(pythond.pysh_main))
     check("pyctl_main", callable(pythond.pyctl_main))
+
+
+def test_session_cli_errors_exit_nonzero():
+    section("session CLI errors exit nonzero")
+    for entry_name, argv, entry in [
+        ("pysh", ["pysh", "run", "missing", "x"], pythond.pysh_main),
+        ("pythond", ["pythond", "run", "missing", "x"], pythond.main),
+    ]:
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(pythond, "_send", return_value="ERR no session"), \
+             mock.patch.object(sys, "stderr", io.StringIO()), \
+             mock.patch.object(sys, "stdout", io.StringIO()):
+            try:
+                entry()
+                check(f"{entry_name} exits nonzero on ERR", False)
+            except SystemExit as e:
+                check(f"{entry_name} exits nonzero on ERR", e.code == 1, e.code)
 
 
 def test_default_sock():
@@ -2065,6 +2129,12 @@ def test_unit_pty_bridge():
     check("re-attach scrollback", b"after detach" in b"".join(received))
 
     bridge.detach(owner)
+    closed = []
+    owner = bridge.attach(lambda data: received.append(data),
+                          lambda: closed.append(True))
+    check("close-callback attach accepted", owner is not None)
+    bridge.close()
+    check("bridge close wakes attached client", closed == [True])
     os.close(w_fd)
     os.close(r_fd)
 
@@ -2183,6 +2253,7 @@ def main():
         test_make_exec_error,
         test_make_exec_on_done,
         test_make_exec_thread_isolation,
+        test_make_exec_restores_replaced_stdio,
         test_thread_stdout_compat_methods,
         test_dispatch_run,
         test_dispatch_fire_poll,
@@ -2208,6 +2279,7 @@ def main():
         test_daemon_meta_read_missing,
         test_cert_fingerprint_missing,
         test_cert_generation,
+        test_trust_cert_exact_fingerprint_store,
         test_cert_generation_no_crypto,
         test_websocket_protocol,
         test_wire_message_builder,
@@ -2220,6 +2292,7 @@ def main():
         test_connection_hardening_static,
         test_has_crypto_flag,
         test_entry_points_exist,
+        test_session_cli_errors_exit_nonzero,
         test_default_sock,
         test_secure_path_win32,
 

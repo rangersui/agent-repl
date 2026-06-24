@@ -288,6 +288,13 @@ Successful synchronous `run` cells are appended to
 are appended when `poll` observes completion. If a session dies, replay:
 `pysh run <name> "exec(open(...).read())"`.
 
+Like shell history and environment variables under SSH, pythond session history,
+logs, and live namespaces can expose secrets. `history.py` and `session.log` may
+contain executed Python source and captured output. Variables assigned in a
+session remain in that live Python process until overwritten or the session is
+killed. Do not paste API keys, passwords, tokens, or other secrets into cells
+unless you are willing for them to persist in that session and its local files.
+
 ## Protocol Notes
 
 WebSocket text frames. First line = command + args. After first `\n` = code body.

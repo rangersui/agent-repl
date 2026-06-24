@@ -226,6 +226,13 @@ Successful synchronous `run` cells are saved to `~/.pythond/sessions/<name>/hist
 Successful async `fire`/`fork` cells are saved when `poll` observes completion.
 Errors go to `session.log` but not `history.py`.
 
+Like shell history and environment variables under SSH, pythond session history,
+logs, and live namespaces can expose secrets. `history.py` and `session.log` may
+contain executed Python source and captured output. Variables assigned in a
+session remain in that live Python process until overwritten or the session is
+killed. Do not paste API keys, passwords, tokens, or other secrets into cells
+unless you are willing for them to persist in that session and its local files.
+
 ```bash
 # Process died? Replay:
 pysh new work

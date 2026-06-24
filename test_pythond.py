@@ -1539,6 +1539,11 @@ def test_connection_hardening_static():
     check("attach closes websocket on handshake failure",
           "ERR attach failed" in attach_seg and "ws.close()" in attach_seg)
     check("attach reports failure", "-> bool" in attach_seg)
+    check("attach stream helper returns status",
+          "return _attach_ws_win(ws, name)" in attach_seg and
+          "return _attach_ws_pty(ws, name)" in attach_seg and
+          ") -> bool:" in attach_loop_seg and
+          "ERR attach stream" in attach_loop_seg)
     check("attach terminal setup failure detaches",
           "ws.send(\"detach\")" in attach_seg and
           "return False" in attach_seg)
@@ -1866,6 +1871,8 @@ def test_connection_hardening_static():
     check("attach reader exact detached sentinel",
           "if frame == \"OK detached\":" in attach_reader_seg and
           "\"detached\" in frame" not in attach_reader_seg)
+    check("attach reader always stops loop on exit",
+          "finally:\n        stopped.set()" in attach_reader_seg)
     check("attach preserves bytes before Ctrl-]",
           "data.partition(b\"\\x1d\")" in attach_loop_seg and
           "ws.send(before)" in attach_loop_seg)
@@ -1967,6 +1974,69 @@ def test_session_cli_errors_exit_nonzero():
                 check(f"{entry_name} exits nonzero on ERR", False)
             except SystemExit as e:
                 check(f"{entry_name} exits nonzero on ERR", e.code == 1, e.code)
+
+
+def test_attach_loop_reports_stream_failure():
+    section("attach loop reports stream failure")
+
+    class ClosedWs:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+        def recv(self, timeout=0):
+            return pythond._WS_CLOSE
+        def send(self, data):
+            self.sent.append(data)
+        def close(self):
+            self.closed = True
+
+    restored = []
+    ws = ClosedWs()
+    def wait_for_reader_stop(stopped):
+        stopped.wait(0.1)
+        return None
+    with mock.patch.object(sys, "stderr", io.StringIO()), \
+         mock.patch.object(sys, "stdout", io.StringIO()):
+        ok = pythond._attach_ws_loop(
+            ws,
+            "",
+            wait_for_reader_stop,
+            lambda: restored.append(True),
+        )
+    check("stream close returns failure", ok is False)
+    check("stream close restores terminal", restored == [True])
+    check("stream close closes websocket", ws.closed is True)
+
+
+def test_attach_loop_reports_clean_detach():
+    section("attach loop reports clean detach")
+
+    class CleanWs:
+        def __init__(self):
+            self.detached = threading.Event()
+            self.closed = False
+        def recv(self, timeout=0):
+            self.detached.wait(timeout=1)
+            return "OK detached"
+        def send(self, data):
+            if data == "detach":
+                self.detached.set()
+        def close(self):
+            self.closed = True
+
+    restored = []
+    ws = CleanWs()
+    with mock.patch.object(sys, "stderr", io.StringIO()), \
+         mock.patch.object(sys, "stdout", io.StringIO()):
+        ok = pythond._attach_ws_loop(
+            ws,
+            "",
+            lambda stopped: b"\x1d",
+            lambda: restored.append(True),
+        )
+    check("local detach returns success", ok is True)
+    check("local detach restores terminal", restored == [True])
+    check("local detach closes websocket", ws.closed is True)
 
 
 def test_access_log_sanitises_session_field():
@@ -3075,6 +3145,8 @@ def main():
         test_has_crypto_flag,
         test_entry_points_exist,
         test_session_cli_errors_exit_nonzero,
+        test_attach_loop_reports_stream_failure,
+        test_attach_loop_reports_clean_detach,
         test_access_log_sanitises_session_field,
         test_pyctl_cert_role_hints,
         test_pyctl_status_uses_env_endpoint,

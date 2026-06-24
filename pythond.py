@@ -3287,9 +3287,9 @@ def attach(name: str) -> bool:
 
     try:
         if sys.platform == "win32":
-            _attach_ws_win(ws, name)
+            return _attach_ws_win(ws, name)
         else:
-            _attach_ws_pty(ws, name)
+            return _attach_ws_pty(ws, name)
     except Exception as e:
         try:
             ws.send("detach")
@@ -3301,9 +3301,12 @@ def attach(name: str) -> bool:
             pass  # connection closing -- send/close may fail
         print(f"ERR attach failed: {_public_error(e)}", file=sys.stderr)
         return False
-    return True
 
-def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
+def _attach_reader(
+    ws: WebSocketLike,
+    stopped: threading.Event,
+    clean: threading.Event,
+) -> None:
     """WebSocket output -> stdout for both POSIX and Windows attach."""
     try:
         while not stopped.is_set():
@@ -3317,13 +3320,15 @@ def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
                 os.write(sys.stdout.fileno(), frame)
             elif isinstance(frame, str):
                 if frame == "OK detached":
+                    clean.set()
                     break
                 print(frame, file=sys.stderr)
     except Exception as e:
         if not stopped.is_set():
             print(f"WARN: attach reader failed: {e.__class__.__name__}",
                   file=sys.stderr)
-    stopped.set()
+    finally:
+        stopped.set()
 
 
 def _attach_ws_loop(
@@ -3331,14 +3336,17 @@ def _attach_ws_loop(
     name: str,
     read_input: typing.Callable[[threading.Event], bytes | None],
     restore_terminal: typing.Callable[[], None],
-) -> None:
+) -> bool:
     """Shared attach loop. read_input returns bytes, None, or b'' for EOF."""
     if name:
         print(f"attached to {name} (Ctrl-] to detach)", file=sys.stderr)
     stopped = threading.Event()
+    clean = threading.Event()
+    local_detach = False
+    stream_failed = False
     t: threading.Thread | None = None
     try:
-        t = threading.Thread(target=_attach_reader, args=(ws, stopped),
+        t = threading.Thread(target=_attach_reader, args=(ws, stopped, clean),
                              daemon=True)
         t.start()
         while not stopped.is_set():
@@ -3346,6 +3354,7 @@ def _attach_ws_loop(
             if data is None:
                 continue
             if not data or b"\x1d" in data:  # Ctrl-]
+                local_detach = True
                 before, _, _after = data.partition(b"\x1d")
                 if before:
                     with contextlib.suppress(Exception):
@@ -3354,26 +3363,35 @@ def _attach_ws_loop(
             try:
                 ws.send(data)
             except Exception:
+                stream_failed = True
                 break
     except (KeyboardInterrupt, OSError):
-        pass  # user interrupted -- normal exit
+        local_detach = True  # user interrupted -- normal exit
     finally:
         stopped.set()
-        if t is not None:
-            t.join(timeout=3)
-        restore_terminal()
         try:
             ws.send("detach")
         except Exception:
-            pass  # connection closing -- send/close may fail
+            if local_detach:
+                stream_failed = True
+        if t is not None:
+            t.join(timeout=3)
+        restore_terminal()
         try:
             ws.close()
         except Exception:
             pass  # connection closing -- send/close may fail
         print()
+    if stream_failed:
+        print("ERR attach stream failed", file=sys.stderr)
+        return False
+    if local_detach or clean.is_set():
+        return True
+    print("ERR attach stream ended unexpectedly", file=sys.stderr)
+    return False
 
 
-def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> None:
+def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> bool:
     """POSIX raw terminal attach via WebSocket."""
     if not sys.stdin.isatty():
         raise RuntimeError("attach requires a TTY")
@@ -3393,10 +3411,10 @@ def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> None:
             old,
         )
 
-    _attach_ws_loop(ws, name, read_input, restore_terminal)
+    return _attach_ws_loop(ws, name, read_input, restore_terminal)
 
 
-def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
+def _attach_ws_win(ws: WebSocketLike, name: str = "") -> bool:
     """Windows raw terminal attach via WebSocket."""
     if not sys.stdin.isatty():
         raise RuntimeError("attach requires a TTY")
@@ -3444,7 +3462,7 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
         kernel32.SetConsoleMode(stdin_h, old_in.value)
         kernel32.SetConsoleMode(stdout_h, old_out.value)
 
-    _attach_ws_loop(ws, name, read_input, restore_terminal)
+    return _attach_ws_loop(ws, name, read_input, restore_terminal)
 
 def _worker_entry(argv: list[str]) -> bool:
     """Handle internal worker subprocess entry points."""

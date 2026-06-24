@@ -1545,6 +1545,12 @@ def test_connection_hardening_static():
     check("daemon acknowledges attach before scrollback",
           "ws.send(\"OK attached\")\n"
           "                        if not bridge.flush_scrollback(owner):" in daemon_full_seg)
+    check("daemon attach locks and verifies current session",
+          "lock = _session_lock(s)" in daemon_full_seg and
+          "with lock:" in daemon_full_seg and
+          "if _get_session(aname) is not s:" in daemon_full_seg and
+          daemon_full_seg.index("if _get_session(aname) is not s:") <
+          daemon_full_seg.index("owner = bridge.attach("))
     check("PtyBridge buffers output until attach acknowledgement",
           "_pending_send_fn" in pty_bridge_seg and
           "def flush_scrollback(self, owner: object) -> bool:" in pty_bridge_seg)
@@ -1914,6 +1920,11 @@ def test_connection_hardening_static():
           "_access_log(\"result\"" in daemon_full_seg and
           "_access_log(\"disconnect\"" in daemon_full_seg and
           "conn_id=conn_id" in daemon_full_seg)
+    check("auth rejection still logs disconnect",
+          daemon_full_seg.index("try:\n            # auth check for TCP mode") <
+          daemon_full_seg.index("if not hmac.compare_digest") <
+          daemon_full_seg.index("return\n                _access_log(\"auth\"") <
+          daemon_full_seg.index("finally:\n            _access_log(\"disconnect\""))
     check("daemon command access log omits body content",
           "body_len = len(body.encode" in daemon_full_seg and
           "session_name = args[0] if args else \"\"" in daemon_full_seg and

@@ -2975,24 +2975,24 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
         peer = getattr(ws, "remote_address", None)
         conn_id = next(_ACCESS_CONN_SEQ)
         _access_log("connect", conn_id=conn_id, peer=peer)
-        # auth check for TCP mode
-        if _daemon_token:
-            auth = ws.request.headers.get("Authorization", "")
-            token = ""
-            if auth.startswith("Bearer "):
-                token = auth[len("Bearer "):]
-            if not hmac.compare_digest(token or "", _daemon_token):
-                _access_log("auth", conn_id=conn_id, peer=peer, status="rejected")
-                try:
-                    ws.send("ERR auth failed")
-                except Exception as e:
-                    print(f"WARN: auth failure response failed: {e.__class__.__name__}",
-                          file=sys.stderr)
-                print(f"WARN: auth rejected from {peer}", file=sys.stderr)
-                return
-            _access_log("auth", conn_id=conn_id, peer=peer, status="ok")
-        # keep-alive: handle multiple messages per connection
         try:
+            # auth check for TCP mode
+            if _daemon_token:
+                auth = ws.request.headers.get("Authorization", "")
+                token = ""
+                if auth.startswith("Bearer "):
+                    token = auth[len("Bearer "):]
+                if not hmac.compare_digest(token or "", _daemon_token):
+                    _access_log("auth", conn_id=conn_id, peer=peer, status="rejected")
+                    try:
+                        ws.send("ERR auth failed")
+                    except Exception as e:
+                        print(f"WARN: auth failure response failed: {e.__class__.__name__}",
+                              file=sys.stderr)
+                    print(f"WARN: auth rejected from {peer}", file=sys.stderr)
+                    return
+                _access_log("auth", conn_id=conn_id, peer=peer, status="ok")
+            # keep-alive: handle multiple messages per connection
             for raw in ws:
                 if isinstance(raw, bytes):
                     _access_log("command", conn_id=conn_id, peer=peer, status="rejected",
@@ -3025,26 +3025,33 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                                     status="no-session")
                         ws.send(f"ERR no session '{aname}'")
                         continue
-                    bridge = s.get("bridge")
-                    if not bridge:
-                        _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
-                                    status="no-pty")
-                        ws.send(f"ERR session '{aname}' has no PTY")
-                        continue
-                    if len(args) >= 3:
-                        resize_resp = _handle_resize([aname, args[1], args[2]])
-                        if resize_resp != "OK":
+                    lock = _session_lock(s)
+                    with lock:
+                        if _get_session(aname) is not s:
                             _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
-                                        status="resize-failed")
-                            ws.send(resize_resp)
+                                        status="stale-session")
+                            ws.send(f"ERR no session '{aname}'")
                             continue
-                    owner = bridge.attach(lambda data: ws.send(data),
-                                          lambda: ws.close())
-                    if owner is None:
-                        _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
-                                    status="busy")
-                        ws.send(f"ERR session '{aname}' already attached")
-                        continue
+                        bridge = s.get("bridge")
+                        if not bridge:
+                            _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                        status="no-pty")
+                            ws.send(f"ERR session '{aname}' has no PTY")
+                            continue
+                        if len(args) >= 3:
+                            resize_resp = _handle_resize([aname, args[1], args[2]])
+                            if resize_resp != "OK":
+                                _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                            status="resize-failed")
+                                ws.send(resize_resp)
+                                continue
+                        owner = bridge.attach(lambda data: ws.send(data),
+                                              lambda: ws.close())
+                        if owner is None:
+                            _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
+                                        status="busy")
+                            ws.send(f"ERR session '{aname}' already attached")
+                            continue
                     try:
                         _access_log("attach", conn_id=conn_id, peer=peer, session=aname,
                                     status="ok")

@@ -1298,6 +1298,79 @@ def test_wspro_client_payload_limit():
         pythond._MAX_WS_PAYLOAD = old_limit
 
 
+def test_tls_bridge_send_all_times_out_on_want_read():
+    section("TLS bridge send_all times out on WantRead")
+
+    class WantReadSock:
+        def send(self, data):
+            raise pythond._ssl.SSLWantReadError()
+
+    old_timeout = pythond._TLS_BRIDGE_IO_TIMEOUT
+    pythond._TLS_BRIDGE_IO_TIMEOUT = 0.01
+    try:
+        with mock.patch.object(pythond.select, "select",
+                               return_value=([], [], [])) as sel:
+            ok = pythond._TlsTerminatedServer._send_all(WantReadSock(), b"x")
+    finally:
+        pythond._TLS_BRIDGE_IO_TIMEOUT = old_timeout
+    check("WantRead timeout returns false", ok is False)
+    check("WantRead waits readable", sel.call_args[0][0] != [] and sel.call_args[0][1] == [])
+
+
+def test_tls_bridge_send_all_times_out_on_want_write():
+    section("TLS bridge send_all times out on WantWrite")
+
+    class WantWriteSock:
+        def send(self, data):
+            raise pythond._ssl.SSLWantWriteError()
+
+    old_timeout = pythond._TLS_BRIDGE_IO_TIMEOUT
+    pythond._TLS_BRIDGE_IO_TIMEOUT = 0.01
+    try:
+        with mock.patch.object(pythond.select, "select",
+                               return_value=([], [], [])) as sel:
+            ok = pythond._TlsTerminatedServer._send_all(WantWriteSock(), b"x")
+    finally:
+        pythond._TLS_BRIDGE_IO_TIMEOUT = old_timeout
+    check("WantWrite timeout returns false", ok is False)
+    check("WantWrite waits writable", sel.call_args[0][0] == [] and sel.call_args[0][1] != [])
+
+
+def test_tls_bridge_recv_want_read_waits_instead_of_spinning():
+    section("TLS bridge recv WantRead waits")
+
+    class FakeTls:
+        def __init__(self):
+            self.recv_calls = 0
+        def setblocking(self, value):
+            pass
+        def pending(self):
+            return 1
+        def recv(self, size):
+            self.recv_calls += 1
+            raise pythond._ssl.SSLWantReadError()
+
+    class FakeInner:
+        def setblocking(self, value):
+            pass
+
+    fake_tls = FakeTls()
+    fake_inner = FakeInner()
+    server = object.__new__(pythond._TlsTerminatedServer)
+    server._stopped = threading.Event()
+    old_timeout = pythond._TLS_BRIDGE_IO_TIMEOUT
+    pythond._TLS_BRIDGE_IO_TIMEOUT = 0.01
+    try:
+        with mock.patch.object(pythond.select, "select",
+                               side_effect=[([], [], []), ([], [], [])]) as sel:
+            server._bridge(fake_tls, fake_inner)
+    finally:
+        pythond._TLS_BRIDGE_IO_TIMEOUT = old_timeout
+    check("recv called once before timeout", fake_tls.recv_calls == 1,
+          fake_tls.recv_calls)
+    check("bridge waited after WantRead", sel.call_count == 2, sel.call_count)
+
+
 def test_tls_and_auth_hardening_static():
     section("TLS/auth hardening")
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
@@ -1389,7 +1462,10 @@ def test_connection_hardening_static():
 
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
-          "                    select.select([], [sock], [], 1.0)" in src)
+          "                    _, writable, _ = select.select([], [sock], []" in src)
+    check("TLS bridge I/O has timeout",
+          "_TLS_BRIDGE_IO_TIMEOUT" in src and
+          "deadline = time.monotonic() + _TLS_BRIDGE_IO_TIMEOUT" in send_all_seg)
     check("zero-byte send does not spin",
           "if sent == 0:" in send_all_seg and
           "if sent == 0:\n                        return False" in send_all_seg)
@@ -1425,6 +1501,9 @@ def test_connection_hardening_static():
     check("send rejects binary command responses",
           "isinstance(resp, bytes)" in send_seg and
           "ERR binary response not allowed in command mode" in send_seg)
+    check("send preserves connection error detail",
+          "ERR cannot connect: {_public_error(e)}" in send_seg and
+          "except Exception:\n        return None" not in send_seg)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
     check("wsproto is used for WSS framing",
@@ -1468,6 +1547,10 @@ def test_connection_hardening_static():
     check("TLS bridge polls inner while TLS has pending data",
           "tls_sock.pending()" in tls_server_seg and
           "select.select([inner_sock], [], [], 0)" in tls_server_seg)
+    check("TLS bridge waits on WantRead instead of spinning",
+          "except _ssl.SSLWantReadError:" in tls_server_seg and
+          "readable_again, _, _ = select.select([src], [], []" in tls_server_seg and
+          "if not readable_again:\n                        return" in tls_server_seg)
     check("handle_client uses dispatch table", "_CONTROL_HANDLERS.get(cmd)" in handle_seg)
     check("handle_client no elif chain", "elif cmd" not in handle_seg)
     check("runtime dir uses private helper", "_ensure_private_dir" in runtime_seg)
@@ -1742,6 +1825,10 @@ def test_connection_hardening_static():
           "parser.print_help(sys.stderr)" in pyctl_seg)
     check("unix socket created under private umask",
           "os.umask(0o177)" in src and "ws_unix_serve" in src)
+    check("unix socket parent dir validated before bind",
+          "_ensure_private_dir(os.path.dirname(SOCK))" in daemon_seg and
+          daemon_seg.index("_ensure_private_dir(os.path.dirname(SOCK))") <
+          daemon_seg.index("os.unlink(SOCK)"))
     check("tcp daemon alive ignores auth error text",
           "ERR auth failed" not in tcp_alive_seg and
           "return True" in tcp_alive_seg and
@@ -1875,6 +1962,37 @@ def test_send_rejects_binary_command_response():
     check("binary response becomes ERR",
           resp == "ERR binary response not allowed in command mode", resp)
     check("binary response closes ws", fake.closed is True)
+
+
+def test_send_reports_connect_failure_detail():
+    section("_send reports connect failure detail")
+
+    with mock.patch.object(pythond, "_connect_daemon",
+                           side_effect=RuntimeError("TLS pin mismatch")):
+        resp = pythond._send("ls", [])
+    check("connect failure is visible",
+          resp == "ERR cannot connect: TLS pin mismatch", resp)
+
+
+def test_send_reports_recv_failure_detail():
+    section("_send reports recv failure detail")
+
+    class FakeWs:
+        def __init__(self):
+            self.closed = False
+        def send(self, msg):
+            pass
+        def recv(self, timeout=None):
+            raise RuntimeError("websocket rejected")
+        def close(self):
+            self.closed = True
+
+    fake = FakeWs()
+    with mock.patch.object(pythond, "_connect_daemon", return_value=fake):
+        resp = pythond._send("ls", [])
+    check("recv failure is visible",
+          resp == "ERR cannot connect: websocket rejected", resp)
+    check("recv failure closes ws", fake.closed is True)
 
 
 def test_default_sock():
@@ -2311,7 +2429,11 @@ def test_integration_tls_pinned_server():
                     resp = pythond._send("ls", [])
                     check("tls ls works", "(no sessions)" in resp, resp)
                     resp = pythond._send("stop", [])
-                    check("tls stop sent", resp is None or "OK stopping daemon" in resp, resp)
+                    check("tls stop sent",
+                          resp is None or
+                          "OK stopping daemon" in resp or
+                          "ERR cannot connect: ConnectionResetError" in resp,
+                          resp)
                 finally:
                     for key, value in [
                         ("PYTHOND_HOST", old_host),
@@ -2829,6 +2951,9 @@ def main():
         test_wspro_client_basic,
         test_wspro_client_preserves_batched_frames,
         test_wspro_client_payload_limit,
+        test_tls_bridge_send_all_times_out_on_want_read,
+        test_tls_bridge_send_all_times_out_on_want_write,
+        test_tls_bridge_recv_want_read_waits_instead_of_spinning,
         test_tls_and_auth_hardening_static,
         test_connection_hardening_static,
         test_has_crypto_flag,
@@ -2838,6 +2963,8 @@ def main():
         test_pyctl_cert_role_hints,
         test_pyctl_status_uses_env_endpoint,
         test_send_rejects_binary_command_response,
+        test_send_reports_connect_failure_detail,
+        test_send_reports_recv_failure_detail,
         test_default_sock,
         test_secure_path_win32,
 

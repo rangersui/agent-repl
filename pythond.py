@@ -154,6 +154,7 @@ _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
 _MAX_WORKER_RESPONSE = int(os.environ.get("PYTHOND_MAX_WORKER_RESPONSE", str(16 * 1024 * 1024)))
 _MAX_TLS_BRIDGE_THREADS = int(os.environ.get("PYTHOND_MAX_TLS_BRIDGE_THREADS", "256"))
+_TLS_BRIDGE_IO_TIMEOUT = float(os.environ.get("PYTHOND_TLS_BRIDGE_IO_TIMEOUT", "30"))
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _BUFFER_CHUNK = 64 * 1024
 _WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
@@ -974,8 +975,17 @@ class _TlsTerminatedServer:
             for src in readable:
                 try:
                     data = src.recv(_BUFFER_CHUNK)
-                except (_ssl.SSLWantReadError, _ssl.SSLWantWriteError,
-                        BlockingIOError):
+                except _ssl.SSLWantReadError:
+                    readable_again, _, _ = select.select([src], [], [],
+                                                         _TLS_BRIDGE_IO_TIMEOUT)
+                    if not readable_again:
+                        return
+                    continue
+                except (_ssl.SSLWantWriteError, BlockingIOError):
+                    _, writable_again, _ = select.select([], [src], [],
+                                                        _TLS_BRIDGE_IO_TIMEOUT)
+                    if not writable_again:
+                        return
                     continue
                 except (OSError, _ssl.SSLError):
                     return
@@ -987,17 +997,27 @@ class _TlsTerminatedServer:
     @staticmethod
     def _send_all(sock: SocketLike, data: bytes) -> bool:
         view = memoryview(data)
+        deadline = time.monotonic() + _TLS_BRIDGE_IO_TIMEOUT
         try:
             while view:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
                 try:
                     sent = sock.send(view)
                     if sent == 0:
                         return False
                     view = view[sent:]
                 except _ssl.SSLWantReadError:
-                    select.select([sock], [], [], 1.0)
+                    readable, _, _ = select.select([sock], [], [],
+                                                   min(1.0, remaining))
+                    if not readable:
+                        return False
                 except (_ssl.SSLWantWriteError, BlockingIOError):
-                    select.select([], [sock], [], 1.0)
+                    _, writable, _ = select.select([], [sock], [],
+                                                   min(1.0, remaining))
+                    if not writable:
+                        return False
             return True
         except (OSError, _ssl.SSLError):
             return False
@@ -2900,6 +2920,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
     else:
         use_unix = _HAS_AF_UNIX
         if use_unix:
+            _ensure_private_dir(os.path.dirname(SOCK))
             if os.path.exists(SOCK):
                 os.unlink(SOCK)
         else:
@@ -3148,8 +3169,8 @@ def _send(cmd: str, args: list[str]) -> str | None:
     """Send one command to daemon via WebSocket, return response string."""
     try:
         ws = _connect_daemon(timeout=5)
-    except Exception:
-        return None
+    except Exception as e:
+        return f"ERR cannot connect: {_public_error(e)}"
 
     msg = _build_wire_message(cmd, args)
     try:
@@ -3166,12 +3187,12 @@ def _send(cmd: str, args: list[str]) -> str | None:
             return "ERR invalid daemon response"
         ws.close()
         return resp
-    except Exception:
+    except Exception as e:
         try:
             ws.close()
         except Exception:
-            pass  # connection closed -- return None to caller
-        return None
+            pass  # connection close failed while reporting original error
+        return f"ERR cannot connect: {_public_error(e)}"
 
 def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
     """CLI client for non-interactive commands."""

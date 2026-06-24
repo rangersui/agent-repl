@@ -730,6 +730,61 @@ def test_wire_message_builder():
           pythond._build_wire_message("status", ["work"]) == "status work")
 
 
+def test_send_remote_transparent_alias():
+    section("remote transparent alias")
+    sent = []
+
+    class FakeWs:
+        def send(self, msg):
+            sent.append(msg)
+        def recv(self, timeout=None):
+            return "42"
+
+    session = {"type": "remote", "alias": "work", "_ws": FakeWs()}
+    resp = pythond._send_remote(session, {"cmd": "run", "args": ["x + 1"]})
+    check("transparent alias uses proxy name as remote session",
+          sent[-1] == "run work\nx + 1", sent[-1])
+    check("transparent alias response", resp == {"output": "42"}, repr(resp))
+
+    sent.clear()
+    resp = pythond._send_remote(session, {"cmd": "run", "args": ["gpu", "x + 1"]})
+    check("explicit proxy keeps target remote session",
+          sent[-1] == "run gpu\nx + 1", sent[-1])
+    check("explicit proxy response", resp == {"output": "42"}, repr(resp))
+
+
+def test_session_command_arg_normalization():
+    section("session command arg normalization")
+    with pythond._sessions_lock:
+        saved = dict(pythond.sessions)
+        pythond.sessions.clear()
+        pythond.sessions["server"] = {"type": "remote"}
+        pythond.sessions["work"] = {"type": "local"}
+    calls = []
+
+    def fake_send(name, msg):
+        calls.append((name, msg))
+        return {"output": "ok"}
+
+    try:
+        with mock.patch.object(pythond, "send_session", fake_send), \
+             mock.patch.object(pythond, "_log_session"), \
+             mock.patch.object(pythond, "_log_history"), \
+             mock.patch.object(sys, "stderr", io.StringIO()):
+            pythond._handle_session_command("run", ["server", "work", "x", "+", "1"])
+            check("remote proxy keeps target session and joins code",
+                  calls[-1] == ("server", {"cmd": "run", "args": ["work", "x + 1"]}),
+                  repr(calls[-1]))
+            pythond._handle_session_command("run", ["work", "x", "+", "1"])
+            check("local run joins code remainder",
+                  calls[-1] == ("work", {"cmd": "run", "args": ["x + 1"]}),
+                  repr(calls[-1]))
+    finally:
+        with pythond._sessions_lock:
+            pythond.sessions.clear()
+            pythond.sessions.update(saved)
+
+
 class _FakeWsSock:
     def __init__(self, data: bytes = b""):
         self.data = bytearray(data)
@@ -1078,6 +1133,8 @@ def test_connection_hardening_static():
           "argparse.ArgumentParser" in main_seg and
           "argparse.ArgumentParser" in pysh_seg and
           "argparse.ArgumentParser" in pyctl_seg)
+    check("pysh run accepts remote proxy target session",
+          "p_cmd.add_argument(\"code\", nargs=argparse.REMAINDER)" in pysh_seg)
     check("manual help strings removed",
           "_PYSH_HELP" not in src and "_PYCTL_HELP" not in src)
     check("remote resize fails explicitly",
@@ -2068,6 +2125,8 @@ def main():
         test_cert_generation_no_crypto,
         test_websocket_protocol,
         test_wire_message_builder,
+        test_send_remote_transparent_alias,
+        test_session_command_arg_normalization,
         test_wspro_client_basic,
         test_wspro_client_payload_limit,
         test_tls_and_auth_hardening_static,

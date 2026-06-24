@@ -92,8 +92,9 @@ pyctl start --listen 0.0.0.0:7399 --tls --show-token
 # client: pin server cert, then connect
 # copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
 pyctl pin ~/server_cert.pem
-pyctl connect server 10.0.0.5:7399 &lt;token&gt; --tls
-pysh run server work "import platform; platform.node()"
+pythond daemon
+pyctl connect work 10.0.0.5:7399 &lt;token&gt; --tls
+pysh run work "import platform; platform.node()"
 # remote-host-01
 </pre>
 
@@ -113,8 +114,9 @@ pyctl start --listen 0.0.0.0:7399 --tls --show-token
 
 # client: pin server cert, then connect (client cert sent automatically)
 pyctl pin ~/server_cert.pem
-pyctl connect server 10.0.0.5:7399 &lt;token&gt; --tls
-pysh run server work "x"
+pythond daemon
+pyctl connect work 10.0.0.5:7399 &lt;token&gt; --tls
+pysh run work "x"
 </pre>
 
 <h2>Write file, then exec</h2>
@@ -161,8 +163,8 @@ pysh complete &lt;name&gt; "text"  JSON completion candidates
 
 pyctl start [--listen H:P] [--tls] [--show-token]  start daemon
 pyctl stop                           stop daemon
-pyctl status                         daemon process info
-pyctl connect &lt;name&gt; &lt;h:p&gt; &lt;tok&gt;    proxy to remote
+pyctl status                         daemon endpoint metadata and liveness
+pyctl connect &lt;name&gt; &lt;h:p&gt; &lt;tok&gt; [--tls]  proxy to remote
 pyctl disconnect &lt;name&gt;             drop remote
 pyctl cert                           show/generate TLS cert
 pyctl trust &lt;cert.pem&gt;              authorize client
@@ -205,7 +207,7 @@ ws.send("ls")                          # "  work: alive"
 
 <p>Access logs are written as <code>ACCESS</code> lines to runtime <code>access.log</code>
 and mirrored to stderr for supervisors. They include <code>conn_id</code>, peer,
-command, session, status, and <code>body_bytes</code>; they do not include tokens
+<code>cmd</code>, session, status, and <code>body_bytes</code>; they do not include tokens
 or Python code bodies.</p>
 
 <h2>Platform</h2>
@@ -221,6 +223,7 @@ or Python code bodies.</p>
 <table>
 <tr><th>Package</th><th>Role</th></tr>
 <tr><td>websockets</td><td>protocol transport</td></tr>
+<tr><td>wsproto</td><td>raw WSS client framing</td></tr>
 <tr><td>cryptography</td><td>TLS cert generation and pinning</td></tr>
 <tr><td>pywinpty</td><td>Windows PTY (Windows only)</td></tr>
 </table>

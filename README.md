@@ -86,8 +86,8 @@ not need to parse ANSI escape sequences, cursor movement, prompts, or screen
 redraws to know when a cell finished.
 
 The human channel is interactive: `pysh attach` connects to the same process
-through PTY, WinPTY, or socket-console mode. A human can inspect variables,
-interrupt with Ctrl-C, or detach with `Ctrl-]` without discarding the namespace.
+through PTY or WinPTY. A human can inspect variables, interrupt with Ctrl-C, or
+detach with `Ctrl-]` without discarding the namespace.
 
 That split is the core design: pure data for agents, real terminal ergonomics
 for humans, one shared runtime underneath.
@@ -108,7 +108,7 @@ AI agents use it as their Python runtime. Humans use `pysh attach` for an intera
 
 AI can't ssh. A human would `ssh server` then `python -i` — done. An AI agent can only do one-shot `bash_tool` calls, so it can't hold an SSH session open.
 
-The two-daemon pattern solves this: the local daemon holds the connection the AI can't hold. `pyctl connect` tells the local daemon to proxy to a remote daemon. After that, `pysh run remote work "code"` works transparently — pysh doesn't know the session is remote.
+The two-daemon pattern solves this: the local daemon holds the connection the AI can't hold. `pyctl connect` tells the local daemon to proxy to a remote daemon. By default the proxy name is also the remote session name, so remote use looks local: `pyctl connect work ...` then `pysh run work "code"`. For advanced routing, use explicit proxy form: `pysh run server work "code"`.
 
 ## fire vs fork
 
@@ -121,7 +121,7 @@ pysh fork work "model = train(data)"    # process — killable, pickles back
 
 **fire** (threading.Thread): Code runs in a thread that shares the session namespace. Exec is serialized (one cell at a time) — async to the client, not parallel. Variables set by fire'd code are immediately visible to later calls. Cannot be force-killed when stuck in C code (requests.get, time.sleep). `pysh kill` (whole session) is the escape.
 
-**fork** (multiprocessing.Process, POSIX only): Code runs in a child process with a copy of the namespace. New/changed variables are pickled back and merged when done. `pysh int` kills it (SIGKILL). Unpicklable objects (sockets, locks, CUDA tensors) are skipped — the poll response tells you what didn't come back. In-place mutations (`list.append`, `dict[k]=v`) won't merge — use assignment (`x = new_value`). Merge is last-writer-wins: a completed fork may overwrite variables changed in the parent while running.
+**fork** (`os.fork()`, POSIX only): Code runs in a child process with a copy of the namespace. New/changed variables are pickled back and merged when done. `pysh int` kills it (SIGKILL). Unpicklable objects (sockets, locks, CUDA tensors) are skipped -- the poll response tells you what didn't come back. In-place mutations (`list.append`, `dict[k]=v`) won't merge -- use assignment (`x = new_value`). Failed forks do not merge. Merge is last-writer-wins: a completed fork may overwrite variables changed in the parent while running.
 
 ```json
 // poll after fork completes
@@ -203,15 +203,23 @@ Local daemon maintains connection to remote daemon. Agent just talks to local.
 
 ```bash
 pythond daemon                                    # local daemon
-pyctl connect server 10.0.0.5:7399 <token>        # connect to remote
-pysh run server work "x = 42"                     # forwarded to remote
-pysh run server work "x"                          # → 42 (remote state)
-pyctl disconnect server
+pyctl connect work 10.0.0.5:7399 <token> --tls    # proxy alias = remote session
+pysh run work "x = 42"                            # forwarded to remote work
+pysh run work "x"                                 # → 42 (remote state)
+pyctl disconnect work
+```
+
+One local proxy can also address a different remote session explicitly:
+
+```bash
+pyctl connect server 10.0.0.5:7399 <token> --tls  # proxy alias
+pysh run server gpu "x = 42"                      # remote session = gpu
 ```
 
 ## Auto-checkpoint
 
-Every successful exec is saved to `~/.pythond/sessions/<name>/history.py`.
+Successful synchronous `run` cells are saved to `~/.pythond/sessions/<name>/history.py`.
+Successful async `fire`/`fork` cells are saved when `poll` observes completion.
 Errors go to `session.log` but not `history.py`.
 
 ```bash
@@ -236,8 +244,8 @@ Once authenticated, a client has full access to all sessions — there is no per
 - **Not a sandbox**: code runs with the daemon user's OS permissions
 - **Local POSIX**: AF_UNIX socket with `0o600` permissions
 - **Local Windows**: OWNER RIGHTS DACL via `icacls` — owner-level isolation (comparable to Unix `chmod 700`)
-- **Remote**: TLS (Ed25519 self-signed cert) + token auth, with optional mTLS client cert and server pinning
-- **Access logs**: daemon writes `ACCESS` lines to runtime `access.log` and stderr for supervisors; logs include `conn_id`, peer, command, session, status, and `body_bytes`, but never token or code body
+- **Remote**: TLS (self-signed cert) + token auth, with optional mTLS client cert and server pinning
+- **Access logs**: daemon writes `ACCESS` lines to runtime `access.log` and stderr for supervisors; logs include `conn_id`, peer, `cmd`, session, status, and `body_bytes`, but never token or code body
 - **Crash isolation**: 5-layer try/except + process isolation — exec errors never kill daemon
 
 ## Operations
@@ -253,7 +261,7 @@ pyctl start --listen 0.0.0.0:7399 --tls
 Operational signals:
 
 ```bash
-pyctl status          # daemon pid, transport, and liveness
+pyctl status          # daemon endpoint metadata and liveness
 pysh ls               # sessions known to the daemon
 pysh status work      # one session's worker health
 pyctl stop            # graceful daemon shutdown
@@ -264,9 +272,10 @@ Logs:
 - `ACCESS ...` lines are mirrored to stderr for systemd/supervisor/journald.
 - The same access events are appended to the runtime `access.log`.
 - Per-session activity goes to `~/.pythond/sessions/<name>/session.log`.
-- Successful replayable execs go to `~/.pythond/sessions/<name>/history.py`.
+- Successful replayable sync execs go to `~/.pythond/sessions/<name>/history.py`.
+- Successful async execs go there when `poll` observes completion.
 
-Access logs are for daemon operations: connection id, peer, command, session,
+Access logs are for daemon operations: connection id, peer, cmd, session,
 status, and body size. They deliberately do not record tokens or Python source.
 Use `session.log` when you need the executed code and output.
 
@@ -385,7 +394,7 @@ python -B test_pythond.py
 ## Dependencies
 
 ```
-pythond              websockets, cryptography, pywinpty (Windows only)
+pythond              websockets, wsproto, cryptography, pywinpty (Windows only)
 ```
 
 ## License

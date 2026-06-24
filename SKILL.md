@@ -28,8 +28,9 @@ namespace. You and the human are operating the same live runtime.
 ## Default Work Surface
 
 Use the live session as the default work surface. Once a daemon/session exists,
-run task commands through `pysh run`, `pysh fire`, or `pysh fork`, including
-small checks such as `ls`, `pwd`, and `git status`.
+run task logic through `pysh run`, `pysh fire`, or `pysh fork`. The cell is
+Python, so host checks such as `ls`, `pwd`, and `git status` should run through
+`subprocess.run(...)` inside the session when their result belongs to the task.
 
 The host shell is plumbing for starting the daemon, writing Python files to disk
 before loading them, and package management (`pip install`). Everything else goes
@@ -106,7 +107,7 @@ Use `fork` for slow or risky work that should be killable. It runs in a child
 process and pickles new or reassigned variables back into the parent namespace.
 Unpicklable objects (sockets, locks, CUDA tensors) are skipped. In-place
 mutations (`list.append`, `dict[k]=v`) won't merge -- use assignment
-(`x = new_value`).
+(`x = new_value`). Failed forks do not merge.
 
 ```bash
 pysh fork work "results = expensive_search(params)"
@@ -169,19 +170,31 @@ Errors in `run` return traceback text but do not kill the session.
 
 ## Remote Sessions
 
-Remote work uses two daemons. The local daemon holds the connection that a
-one-shot shell tool cannot hold.
+Remote work has two modes.
+
+Use direct remote env vars when each client command can connect straight to the
+remote daemon:
+
+```bash
+export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=<token> PYTHOND_TLS=1
+pysh run work "code"
+```
+
+Use a local proxy daemon when a one-shot shell tool cannot hold the remote
+connection. Default to transparent alias mode: the local proxy name is also the
+remote session name, so the command shape stays local.
 
 ```bash
 # pin server cert, then connect
 pyctl pin ~/server_cert.pem
-pyctl connect server 10.0.0.5:7399 <token> --tls
-pysh run server work "code"
-pysh fire server work "train()"
-pyctl disconnect server
+pyctl connect work 10.0.0.5:7399 <token> --tls
+pysh run work "code"
+pysh fire work "train()"
+pyctl disconnect work
 ```
 
-The remote target syntax is `pysh <command> <server> <session> "code"`.
+Use explicit proxy form only when one proxy should address a different remote
+session: `pysh <command> <proxy> <remote-session> "code"`.
 
 ## Security Model
 
@@ -195,7 +208,7 @@ Treat pythond like SSH into a Python runtime.
 - Remote access uses TLS plus token auth; mTLS adds client cert trust and server
   pinning, but the token is still required.
 - Daemon access logs are written to runtime `access.log` and mirrored to stderr.
-  They include `conn_id`, peer, command, session, status, and `body_bytes`; they
+  They include `conn_id`, peer, `cmd`, session, status, and `body_bytes`; they
   do not include token values or Python code bodies.
 
 ### TLS cert management
@@ -253,13 +266,16 @@ none exist.
 `fork` cells run in a child process. New/changed variables are pickled back
 and merged when done. Unpicklable objects (sockets, locks, CUDA tensors) are
 skipped. In-place mutations (`list.append`, `dict[k]=v`) won't merge -- use
-assignment (`x = new_value`). Merge is last-writer-wins: a finished fork can
-overwrite a variable that the parent changed while the fork was running.
+assignment (`x = new_value`). Failed forks do not merge. Merge is
+last-writer-wins: a finished fork can overwrite a variable that the parent
+changed while the fork was running.
 
 ## Checkpoints
 
-Successful execs are appended to `~/.pythond/sessions/<name>/history.py`.
-If a session dies, replay: `pysh run <name> "exec(open(...).read())"`.
+Successful synchronous `run` cells are appended to
+`~/.pythond/sessions/<name>/history.py`. Successful async `fire`/`fork` cells
+are appended when `poll` observes completion. If a session dies, replay:
+`pysh run <name> "exec(open(...).read())"`.
 
 ## Protocol Notes
 

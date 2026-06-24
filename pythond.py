@@ -41,7 +41,7 @@ Session commands (pysh):
 
 Daemon commands (pyctl / pythond):
     pythond daemon [--listen HOST:PORT] [--tls] [--show-token]
-    pyctl start [--listen HOST:PORT] [--tls]
+    pyctl start [--listen HOST:PORT] [--tls] [--show-token]
     pyctl stop
     pyctl status
     pyctl connect <name> <host:port> <token> [--tls]
@@ -72,11 +72,12 @@ Security (same model as SSH):
     pyctl trust  = authorized_keys (server lets client in).
     pyctl pin    = known_hosts (client verifies server).
   Access logs:   ACCESS lines go to access.log and stderr; they include
-                 conn_id, peer, command, session, status, body_bytes, not code.
+                 conn_id, peer, cmd, session, status, body_bytes, not code.
   Crash containment: per-session worker processes; daemon tries to reap failed sessions.
 
 Auto-checkpoint:
-  ~/.pythond/sessions/<name>/history.py -- successful execs only, replayable.
+  ~/.pythond/sessions/<name>/history.py -- successful sync execs, plus async
+    execs when poll observes completion; replayable.
   ~/.pythond/sessions/<name>/session.log -- all activity including errors.
   $runtime/pythond/access.log -- daemon access log, no tokens or code bodies.
 
@@ -2146,7 +2147,11 @@ def _send_remote(
     cmd = msg.get("cmd", "")
     args = msg.get("args", [])
     if cmd in ("run", "fire", "fork") and len(args) < 2:
-        return {"error": f"remote {cmd} needs target session and code"}
+        alias = session.get("alias")
+        if len(args) == 1 and isinstance(alias, str) and alias:
+            args = [alias, args[0]]
+        else:
+            return {"error": f"remote {cmd} needs target session and code"}
     ws_msg = _build_wire_message(cmd, args)
     for attempt in range(2):
         ws = session.get("_ws")
@@ -2230,6 +2235,7 @@ def connect_remote(
     try:
         _set_session(name, {
             "type": "remote",
+            "alias": name,
             "host": host, "port": port, "token": token,
             "tls": use_tls,
         })
@@ -2404,6 +2410,12 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
     if s is None:
         return f"ERR no session '{name}' -- pysh new {name}"
     inner_args = args[1:]
+    if cmd in ("run", "fire", "fork") and inner_args:
+        if s["type"] == "remote":
+            if len(inner_args) >= 2:
+                inner_args = [inner_args[0], " ".join(inner_args[1:])]
+        else:
+            inner_args = [" ".join(inner_args)]
     if cmd in ("run", "fire", "fork") and inner_args:
         code_str = inner_args[-1] if s["type"] == "remote" else inner_args[0]
         lines = code_str.strip().splitlines()
@@ -3067,7 +3079,7 @@ def main() -> None:
     ):
         p_cmd = sub.add_parser(cname, help=chelp)
         p_cmd.add_argument("name")
-        p_cmd.add_argument("code")
+        p_cmd.add_argument("code", nargs=argparse.REMAINDER)
     p_poll = sub.add_parser("poll", help="check async result")
     p_poll.add_argument("name")
     p_poll.add_argument("cell_id", nargs="?")
@@ -3125,7 +3137,7 @@ def pysh_main() -> None:
     ):
         p_cmd = sub.add_parser(cname, help=chelp)
         p_cmd.add_argument("name")
-        p_cmd.add_argument("code")
+        p_cmd.add_argument("code", nargs=argparse.REMAINDER)
     p_poll = sub.add_parser("poll", help="check async result")
     p_poll.add_argument("name")
     p_poll.add_argument("cell_id", nargs="?")

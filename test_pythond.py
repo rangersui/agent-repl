@@ -2246,6 +2246,15 @@ def free_tcp_port():
     finally:
         s.close()
 
+def wait_until(predicate, timeout=5.0, interval=0.05):
+    """Poll predicate until true or timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
 _HAS_AF_UNIX = sys.platform != "win32" and hasattr(socket, "AF_UNIX")
 
 
@@ -2266,8 +2275,9 @@ def test_integration():
         [sys.executable, str(ROOT / "pythond.py"), "daemon"],
         env=env, stderr=subprocess.PIPE,
     )
-    time.sleep(0.5)
-    check("daemon started", proc.poll() is None)
+    check("daemon started",
+          wait_until(lambda: proc.poll() is None and os.path.exists(sock)),
+          proc.stderr.read().decode(errors="replace") if proc.poll() is not None and proc.stderr else "")
 
     try:
         # ls (empty)
@@ -2363,8 +2373,7 @@ def test_integration():
         # stop
         resp = send_cmd(sock, "stop")
         check("stop OK", "OK" in resp)
-        time.sleep(0.5)
-        check("daemon exited", proc.poll() is not None)
+        check("daemon exited", wait_until(lambda: proc.poll() is not None))
 
     finally:
         if proc.poll() is None:
@@ -2410,8 +2419,10 @@ def test_integration_tcp_windows():
                 stderr_chunks.append(line)
         stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
         stderr_thread.start()
-        time.sleep(1.0)
-        check("tcp daemon started", proc.poll() is None)
+        check("tcp daemon started",
+              wait_until(lambda: proc.poll() is None and
+                         os.path.exists(os.path.join(runtime, "daemon.json"))),
+              "".join(stderr_chunks))
 
         try:
             with mock.patch.object(pythond, "_runtime_dir", return_value=runtime):
@@ -2511,8 +2522,8 @@ def test_integration_tcp_windows():
 
             resp = send_cmd(f"127.0.0.1:{port}", "stop", token=token)
             check("tcp stop OK", "OK" in resp, resp)
-            time.sleep(0.5)
-            check("tcp daemon exited", proc.poll() is not None)
+            check("tcp daemon exited", wait_until(lambda: proc.poll() is not None),
+                  "".join(stderr_chunks))
             if proc.poll() is not None and proc.stderr is not None:
                 stderr_thread.join(timeout=2)
                 stderr = "".join(stderr_chunks)
@@ -2591,7 +2602,8 @@ def test_integration_tls_pinned_server():
                     check("tls stop sent",
                           resp is None or
                           "OK stopping daemon" in resp or
-                          "ERR cannot connect: ConnectionResetError" in resp,
+                          "ERR cannot connect: ConnectionResetError" in resp or
+                          "ERR cannot connect: websocket closed" in resp,
                           resp)
                 finally:
                     for key, value in [
@@ -2603,8 +2615,7 @@ def test_integration_tls_pinned_server():
                             os.environ.pop(key, None)
                         else:
                             os.environ[key] = value
-            time.sleep(0.5)
-            check("tls daemon exited", proc.poll() is not None)
+            check("tls daemon exited", wait_until(lambda: proc.poll() is not None))
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -2632,7 +2643,9 @@ def test_integration_error_not_in_history():
         [sys.executable, str(ROOT / "pythond.py"), "daemon"],
         env=env, stderr=subprocess.PIPE,
     )
-    time.sleep(0.5)
+    check("daemon started",
+          wait_until(lambda: proc.poll() is None and os.path.exists(sock)),
+          proc.stderr.read().decode(errors="replace") if proc.poll() is not None and proc.stderr else "")
 
     try:
         send_cmd(sock, "new", [name])
@@ -2683,7 +2696,9 @@ def test_integration_crash_isolation():
         [sys.executable, str(ROOT / "pythond.py"), "daemon"],
         env=env, stderr=subprocess.PIPE,
     )
-    time.sleep(0.5)
+    check("daemon started",
+          wait_until(lambda: proc.poll() is None and os.path.exists(sock)),
+          proc.stderr.read().decode(errors="replace") if proc.poll() is not None and proc.stderr else "")
 
     from websockets.sync.client import unix_connect
 
@@ -2752,7 +2767,7 @@ def test_integration_crash_isolation():
         ws2.send("stop")
         ws2.recv(timeout=3)
         ws2.close()
-        time.sleep(0.5)
+        wait_until(lambda: proc.poll() is not None)
 
     finally:
         if proc.poll() is None:
@@ -2785,7 +2800,9 @@ def test_integration_ws_attach():
         [sys.executable, str(ROOT / "pythond.py"), "daemon"],
         env=env, stderr=subprocess.PIPE,
     )
-    time.sleep(0.5)
+    check("daemon started",
+          wait_until(lambda: proc.poll() is None and os.path.exists(sock)),
+          proc.stderr.read().decode(errors="replace") if proc.poll() is not None and proc.stderr else "")
 
     from websockets.sync.client import unix_connect
 
@@ -2853,7 +2870,7 @@ def test_integration_ws_attach():
         except Exception:
             pass
         ws3.close()
-        time.sleep(0.5)
+        wait_until(lambda: proc.poll() is not None)
 
     finally:
         if proc.poll() is None:
@@ -3034,8 +3051,9 @@ def test_integration_remote_proxy():
         [sys.executable, str(ROOT / "pythond.py"), "daemon"],
         env=env_a, stderr=subprocess.PIPE,
     )
-    time.sleep(0.5)
-    check("daemon A started", proc_a.poll() is None)
+    check("daemon A started",
+          wait_until(lambda: proc_a.poll() is None and os.path.exists(sock_a)),
+          proc_a.stderr.read().decode(errors="replace") if proc_a.poll() is not None and proc_a.stderr else "")
 
     try:
         # connect A -> B

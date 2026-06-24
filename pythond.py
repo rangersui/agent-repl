@@ -1726,13 +1726,19 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
     # Ctrl-] is handled by the attach client and detaches the human.  If EOF
     # reaches the Python console anyway, restart the prompt so the session
     # stays alive.  exit() raises SystemExit and intentionally kills it.
-    while True:
-        try:
-            LockedConsole(locals=ns).interact(
-                banner="shared with AI. Ctrl-] detaches. exit() kills session.",
-                exitmsg="")
-        except SystemExit:
-            break
+    try:
+        while True:
+            try:
+                LockedConsole(locals=ns).interact(
+                    banner="shared with AI. Ctrl-] detaches. exit() kills session.",
+                    exitmsg="")
+            except SystemExit:
+                break
+    finally:
+        with contextlib.suppress(OSError):
+            ai_sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            ai_sock.close()
 # =============================================
 # DAEMON -- socket + process manager
 # =============================================

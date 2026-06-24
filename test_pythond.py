@@ -732,6 +732,65 @@ def test_close_session_resources_idempotent_under_race():
     check("resource cleared", session.get("ai") is None)
 
 
+def test_recv_session_line_response_limit():
+    section("_recv_session_line response limit")
+
+    class FakeAi:
+        def __init__(self):
+            self.calls = 0
+        def recv(self, size):
+            self.calls += 1
+            return b"x" * 4
+
+    old_limit = pythond._MAX_WORKER_RESPONSE
+    pythond._MAX_WORKER_RESPONSE = 10
+    session = {"ai": FakeAi()}
+    try:
+        try:
+            pythond._recv_session_line(session)
+            raised = False
+        except ValueError as e:
+            raised = str(e) == "worker response too large"
+    finally:
+        pythond._MAX_WORKER_RESPONSE = old_limit
+    check("oversized worker line rejected", raised)
+    check("partial oversized buffer preserved", len(session.get("_ai_buf", b"")) > 10)
+
+
+def test_send_session_marks_large_response_unhealthy():
+    section("send_session marks large response unhealthy")
+
+    class FakeAi:
+        def __init__(self):
+            self.timeout = None
+        def settimeout(self, timeout):
+            self.timeout = timeout
+        def sendall(self, data):
+            pass
+        def recv(self, size):
+            return b"x" * 4
+
+    name = "__large_response__"
+    session = {"type": "pty", "ai": FakeAi()}
+    old_limit = pythond._MAX_WORKER_RESPONSE
+    pythond._MAX_WORKER_RESPONSE = 10
+    with pythond._sessions_lock:
+        pythond.sessions[name] = session
+    try:
+        resp = pythond.send_session(name, {"cmd": "status"}, timeout=1)
+        check("large response returns error",
+              resp == {"error": "worker response too large; use pysh kill to restart"},
+              resp)
+        check("large response marks unhealthy", session.get("_unhealthy") is True)
+        resp2 = pythond.send_session(name, {"cmd": "status"}, timeout=1)
+        check("unhealthy session refuses reuse",
+              "command channel out of sync" in resp2.get("error", ""), resp2)
+    finally:
+        pythond._MAX_WORKER_RESPONSE = old_limit
+        with pythond._sessions_lock:
+            pythond.sessions.pop(name, None)
+
+
 def test_session_dir():
     section("_session_dir")
     name = "__test_session_dir__"
@@ -862,6 +921,28 @@ def test_daemon_meta_tmp_cleanup_on_write_failure():
             except OSError:
                 check("write failed", True)
             check("tmp removed", not os.path.exists(fake_path + ".tmp"))
+
+
+def test_tcp_daemon_alive_does_not_parse_error_text():
+    section("tcp daemon alive ignores command error wording")
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+        def send(self, msg):
+            self.sent.append(msg)
+        def recv(self, timeout=None):
+            return "ERR auth failed with different words"
+        def close(self):
+            self.closed = True
+
+    fake = FakeWs()
+    with mock.patch("websockets.sync.client.connect", return_value=fake):
+        alive = pythond._tcp_daemon_alive({"port": 7399, "token": "bad"})
+    check("error response still means endpoint alive", alive is True)
+    check("probe sent ls", fake.sent == ["ls"], fake.sent)
+    check("probe closed ws", fake.closed is True)
 
 
 def test_cert_fingerprint_missing():
@@ -1241,6 +1322,7 @@ def test_connection_hardening_static():
     pty_bridge_seg = src[src.index("class PtyBridge:"):src.index("def new_session(")]
     add_session_subparsers_seg = src[src.index("def _add_session_subparsers("):src.index("def main(")]
     default_sock_seg = src[src.index("def _default_sock("):src.index("SOCK =")]
+    tcp_alive_seg = src[src.index("def _tcp_daemon_alive("):src.index("def _unix_daemon_alive(")]
     client_start = src.index("def client(")
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
@@ -1484,6 +1566,10 @@ def test_connection_hardening_static():
           "_recv_session_line" in src)
     check("recv_session_line preserves partial buffer",
           "finally:\n        s[\"_ai_buf\"] = buf" in recv_line_seg)
+    check("recv_session_line is bounded",
+          "_MAX_WORKER_RESPONSE" in src and
+          "if len(buf) > _MAX_WORKER_RESPONSE:" in recv_line_seg and
+          "worker response too large" in recv_line_seg)
     check("kill_session has lock timeout",
           "lock.acquire(timeout=3)" in kill_session_seg and
           "should_close = False" in kill_session_seg and
@@ -1495,6 +1581,9 @@ def test_connection_hardening_static():
           "def _close_session_resources_once(" in close_session_seg)
     check("send_session marks OSError unhealthy",
           "except (OSError, json.JSONDecodeError):\n                s[\"_unhealthy\"] = True" in send_session_seg)
+    check("send_session marks oversized worker response unhealthy",
+          "except ValueError:" in send_session_seg and
+          "worker response too large; use pysh kill to restart" in send_session_seg)
     check("timed out command channel stays unhealthy",
           "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
     check("remote does not retry after send",
@@ -1590,6 +1679,10 @@ def test_connection_hardening_static():
           "parser.print_help(sys.stderr)" in pyctl_seg)
     check("unix socket created under private umask",
           "os.umask(0o177)" in src and "ws_unix_serve" in src)
+    check("tcp daemon alive ignores auth error text",
+          "ERR auth failed" not in tcp_alive_seg and
+          "return True" in tcp_alive_seg and
+          "ws.recv(timeout=2)" in tcp_alive_seg)
     check("listen arg parsed by argparse",
           "add_argument(\"--listen\", metavar=\"HOST:PORT\"" in src)
     check("client-visible runtime errors are sanitized",
@@ -2648,6 +2741,8 @@ def main():
         test_disconnect_identity_guard,
         test_resize_dead_pty_not_ok,
         test_close_session_resources_idempotent_under_race,
+        test_recv_session_line_response_limit,
+        test_send_session_marks_large_response_unhealthy,
         test_session_dir,
         test_session_capacity_limit,
         test_log_history,
@@ -2656,6 +2751,7 @@ def main():
         test_daemon_meta_read_missing,
         test_daemon_meta_read_rejects_symlink,
         test_daemon_meta_tmp_cleanup_on_write_failure,
+        test_tcp_daemon_alive_does_not_parse_error_text,
         test_cert_fingerprint_missing,
         test_cert_generation,
         test_trust_cert_exact_fingerprint_store,

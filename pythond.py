@@ -152,6 +152,7 @@ _WS_PROTO: typing.Any = f"pythond.{_protocol_version(__version__)}"
 _WS_HELLO = "tis but a scratch"
 _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
+_MAX_WORKER_RESPONSE = int(os.environ.get("PYTHOND_MAX_WORKER_RESPONSE", str(16 * 1024 * 1024)))
 _MAX_TLS_BRIDGE_THREADS = int(os.environ.get("PYTHOND_MAX_TLS_BRIDGE_THREADS", "256"))
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _BUFFER_CHUNK = 64 * 1024
@@ -452,19 +453,20 @@ def _tcp_daemon_alive(meta: JsonDict) -> bool:
         token = str(meta.get("token", ""))
     except (TypeError, ValueError):
         return False
-    if not token:
-        return False
     ws = None
     try:
         from websockets.sync.client import connect as ws_connect
         ws = ws_connect(f"ws://127.0.0.1:{port}/",
-                        additional_headers=_auth_headers(token),
+                        additional_headers=_auth_headers(token or None),
                         proxy=None,
                         open_timeout=2, close_timeout=1,
                         subprotocols=[_WS_PROTO])
-        ws.send("ls")
-        resp = ws.recv(timeout=2)
-        return resp != "ERR auth failed"
+        try:
+            ws.send("ls")
+            ws.recv(timeout=2)
+        except Exception:
+            pass
+        return True
     except Exception:
         return False
     finally:
@@ -2130,6 +2132,8 @@ def _recv_session_line(s: JsonDict) -> str | None:
             if not chunk:
                 return None
             buf += chunk
+            if len(buf) > _MAX_WORKER_RESPONSE:
+                raise ValueError("worker response too large")
         line, buf = buf.split(b"\n", 1)
         return line.decode("utf-8", "replace")
     finally:
@@ -2166,6 +2170,9 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
                 s["_unhealthy"] = True
                 return {"error": "timeout -- command channel may be out of sync; "
                         "use pysh int or pysh kill if stuck"}
+            except ValueError:
+                s["_unhealthy"] = True
+                return {"error": "worker response too large; use pysh kill to restart"}
             except (OSError, json.JSONDecodeError):
                 s["_unhealthy"] = True
                 return {"error": "session command failed"}

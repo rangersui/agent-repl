@@ -651,6 +651,20 @@ def test_cert_generation():
             fp = pythond._cert_fingerprint(cert)
             check("fingerprint not unknown", fp != "unknown")
             check("fingerprint has colons", ":" in fp)
+            cert_obj = pythond.x509.load_pem_x509_certificate(
+                open(cert, "rb").read()
+            )
+            basic = cert_obj.extensions.get_extension_for_class(
+                pythond.x509.BasicConstraints
+            ).value
+            key_usage = cert_obj.extensions.get_extension_for_class(
+                pythond.x509.KeyUsage
+            ).value
+            check("generated cert is leaf", basic.ca is False)
+            check("generated cert cannot sign certs",
+                  key_usage.key_cert_sign is False)
+            check("generated cert cannot sign CRLs",
+                  key_usage.crl_sign is False)
             # second call returns cached
             cert2, key2 = pythond._generate_cert()
             check("cached same cert", cert2 == cert)
@@ -730,20 +744,47 @@ def test_connection_hardening_static():
     handle_seg = src[src.index("def handle_client("):src.index("def daemon(")]
     runtime_seg = src[src.index("def _runtime_dir("):src.index("def _daemon_meta_path(")]
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
+    cert_dirs_seg = src[src.index("def _trusted_clients_dir("):src.index("def _load_trusted_certs(")]
+    cert_gen_seg = src[src.index("def _generate_cert("):src.index("def _cert_fingerprint(")]
+    send_all_seg = src[src.index("def _send_all("):src.index("# =============================================\n# SHARED WORKER LOGIC")]
+    new_session_seg = src[src.index("def new_session("):src.index("def kill_session(")]
+    fork_monitor_seg = src[src.index("def _fork_monitor("):src.index("elif cmd == \"int\":")]
+    tls_server_seg = src[src.index("class _TlsTerminatedServer:"):src.index("# =============================================\n# SHARED WORKER LOGIC")]
 
     check("blocking send waits write-ready",
           "except (_ssl.SSLWantWriteError, BlockingIOError):\n"
           "                    select.select([], [sock], [], 1.0)" in src)
+    check("zero-byte send does not spin",
+          "if sent == 0:" in send_all_seg and
+          "select.select([], [sock], [], 1.0)" in send_all_seg)
     check("attach uses shared daemon connector", "_connect_daemon(" in attach_seg)
     check("attach no direct ws_connect", "ws_connect" not in attach_seg)
+    check("attach closes websocket on handshake failure",
+          "ERR attach failed" in attach_seg and "ws.close()" in attach_seg)
     check("send uses shared daemon connector", "_connect_daemon(" in send_seg)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
     check("TLS bridge reaps threads", "def _reap_threads" in src and "self._reap_threads()" in src)
+    check("TLS accept loop has timeout",
+          "self._sock.settimeout(1.0)" in tls_server_seg and
+          "except socket.timeout:" in tls_server_seg)
     check("handle_client uses dispatch table", "_CONTROL_HANDLERS.get(cmd)" in handle_seg)
     check("handle_client no elif chain", "elif cmd" not in handle_seg)
     check("runtime dir uses private helper", "_ensure_private_dir" in runtime_seg)
     check("tls dir uses private helper", "_ensure_private_dir" in tls_seg)
+    check("trusted cert dirs use private helper",
+          "_ensure_private_dir" in cert_dirs_seg and "os.makedirs" not in cert_dirs_seg)
+    check("self-signed cert is not a CA",
+          "BasicConstraints(ca=False" in cert_gen_seg and
+          "key_cert_sign=False" in cert_gen_seg and
+          "crl_sign=False" in cert_gen_seg)
+    check("new_session rolls back failed registration",
+          "_close_session_resources(session)" in new_session_seg)
+    check("fork monitor always marks done",
+          "finally:\n                r[\"status\"] = \"done\"" in fork_monitor_seg)
+    check("fork monitor handles unexpected result failures",
+          "(fork result read failed)" in fork_monitor_seg and
+          "except Exception:" in fork_monitor_seg)
 
 
 def test_has_crypto_flag():

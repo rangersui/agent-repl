@@ -429,7 +429,7 @@ def _generate_cert() -> tuple[str, str]:
             critical=False,
         )
         .add_extension(
-            x509.BasicConstraints(ca=True, path_length=None),
+            x509.BasicConstraints(ca=False, path_length=None),
             critical=True,
         )
         .add_extension(
@@ -439,8 +439,8 @@ def _generate_cert() -> tuple[str, str]:
                 key_encipherment=True,
                 data_encipherment=False,
                 key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
+                key_cert_sign=False,
+                crl_sign=False,
                 encipher_only=False,
                 decipher_only=False,
             ),
@@ -492,15 +492,11 @@ def _cert_fingerprint(cert_path: str) -> str:
 
 def _trusted_clients_dir() -> str:
     """Return ~/.pythond/tls/trusted_clients/ -- server trusts these clients."""
-    path = os.path.join(_tls_dir(), "trusted_clients")
-    os.makedirs(path, exist_ok=True)
-    return path
+    return _ensure_private_dir(os.path.join(_tls_dir(), "trusted_clients"))
 
 def _trusted_servers_dir() -> str:
     """Return ~/.pythond/tls/trusted_servers/ -- client trusts these servers."""
-    path = os.path.join(_tls_dir(), "trusted_servers")
-    os.makedirs(path, exist_ok=True)
-    return path
+    return _ensure_private_dir(os.path.join(_tls_dir(), "trusted_servers"))
 
 def _load_trusted_certs(ssl_ctx: _ssl.SSLContext, directory: str) -> int:
     """Load all .pem certs from a directory into SSLContext. Returns count."""
@@ -565,6 +561,7 @@ class _TlsTerminatedServer:
         inner_addr = self._inner.socket.getsockname()
         self._inner_port = inner_addr[1]
         self._sock = socket.create_server((host, port))
+        self._sock.settimeout(1.0)
         self._threads: list[threading.Thread] = []
 
     def serve_forever(self) -> None:
@@ -575,6 +572,8 @@ class _TlsTerminatedServer:
             self._reap_threads()
             try:
                 raw, _addr = self._sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 break
             worker = threading.Thread(target=self._handle, args=(raw,),
@@ -647,6 +646,9 @@ class _TlsTerminatedServer:
             while view:
                 try:
                     sent = sock.send(view)
+                    if sent == 0:
+                        select.select([], [sock], [], 1.0)
+                        return False
                     view = view[sent:]
                 except _ssl.SSLWantReadError:
                     select.select([sock], [], [], 1.0)
@@ -991,8 +993,14 @@ def _dispatch(
                 r["_error"] = True
                 r["_merged"] = []
                 r["_skipped"] = []
-            r["status"] = "done"
-            r["_done_at"] = time.time()
+            except Exception:
+                r["output"] = r.get("output", "") or "(fork result read failed)"
+                r["_error"] = True
+                r["_merged"] = []
+                r["_skipped"] = []
+            finally:
+                r["status"] = "done"
+                r["_done_at"] = time.time()
             r["pid"] = None
         with _cells_lock:
             cells[cid] = res
@@ -1318,10 +1326,15 @@ def new_session(name: str) -> None:
                 return b""
         def _write(data: bytes) -> None:
             proc.write(data.decode(errors="replace"))
-        _set_session(name, {
+        session = {
             "type": "pty", "winpty": proc,
             "ai": ai_conn, "bridge": PtyBridge(_read, _write),
-        })
+        }
+        try:
+            _set_session(name, session)
+        except Exception:
+            _close_session_resources(session)
+            raise
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
     elif _HAS_PTY:
@@ -1335,13 +1348,18 @@ def new_session(name: str) -> None:
         )
         os.close(slave_fd)
         ai_child.close()
-        _set_session(name, {
+        session = {
             "type": "pty", "proc": p, "master_fd": master_fd,
             "ai": ai_parent,
             "bridge": PtyBridge(
                 lambda: os.read(master_fd, 4096),
                 lambda d: os.write(master_fd, d)),
-        })
+        }
+        try:
+            _set_session(name, session)
+        except Exception:
+            _close_session_resources(session)
+            raise
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
     else:
@@ -2339,8 +2357,16 @@ def attach(name: str) -> None:
         return
 
     # request attach
-    ws.send(f"attach {name}")
-    resp = ws.recv(timeout=5)
+    try:
+        ws.send(f"attach {name}")
+        resp = ws.recv(timeout=5)
+    except Exception as e:
+        try:
+            ws.close()
+        except Exception:
+            pass  # connection closing -- send/close may fail
+        print(f"ERR attach failed: {e}", file=sys.stderr)
+        return
     if resp is _WS_CLOSE:
         resp = "ERR daemon closed connection"
     if not resp.startswith("OK"):

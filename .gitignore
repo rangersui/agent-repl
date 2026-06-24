@@ -18,4 +18,5 @@ venv/
 .codex/
 .codex-tmux-outbox.txt
 local/
-k.py
+*.local.py
+*.tmp*

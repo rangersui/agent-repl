@@ -2,434 +2,259 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-tty — exec() killed frame detection</title>
-<meta name="description" content="exec() turns every command into a function call with a return value. AI gets pure data through a pipe. Humans get a real terminal with colors and readline. Same namespace. Python-native runtime.">
+<title>pythond</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#0d1117;
-  --panel:#161b22;
-  --panel2:#1c2128;
-  --border:#30363d;
-  --text:#e6edf3;
-  --dim:#8b949e;
-  --accent:#58a6ff;
-  --green:#3fb950;
-  --yellow:#d29922;
-  --red:#f85149;
-  --purple:#bc8cff;
-  --mono:"SF Mono","Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace;
-  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
-}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-.container{max-width:920px;margin:0 auto;padding:0 24px}
-
-.hero{padding:86px 0 24px;text-align:center}
-.hero h1{font-family:var(--mono);font-size:3rem;line-height:1.1;margin-bottom:14px}
-.hero .accent{color:var(--accent)}
-.tagline{color:var(--dim);font-size:1.15rem;max-width:720px;margin:0 auto 12px;line-height:1.7}
-.tagline strong{color:var(--text);font-weight:500}
-.thesis{
-  color:var(--text);font-family:var(--mono);font-size:1rem;
-  max-width:600px;margin:0 auto 32px;line-height:1.9;
-  background:var(--panel);border:1px solid var(--border);border-radius:10px;
-  padding:18px 24px;text-align:left;
-}
-.thesis .k{color:var(--green)}.thesis .x{color:var(--red);text-decoration:line-through;opacity:.55}
-.install{display:flex;justify-content:center;align-items:center;gap:12px;margin:0 auto 14px}
-.install code{
-  background:var(--panel);border:1px solid var(--border);border-radius:8px;
-  color:var(--green);font-family:var(--mono);font-size:1rem;padding:13px 22px;
-  user-select:all;
-}
-.copy-btn{
-  background:var(--panel);border:1px solid var(--border);border-radius:8px;
-  color:var(--dim);cursor:pointer;font-size:.95rem;padding:13px 16px;
-}
-.copy-btn:hover{border-color:var(--accent);color:var(--accent)}
-.meta{color:var(--dim);font-size:.85rem;margin-bottom:56px}
-
-.terminal{
-  background:var(--panel);border:1px solid var(--border);border-radius:12px;
-  overflow:hidden;margin:0 0 56px;
-}
-.terminal.small{margin:0}
-.terminal.inline{margin:28px 0 20px}
-.terminal-bar{
-  background:var(--panel2);border-bottom:1px solid var(--border);
-  display:flex;align-items:center;gap:8px;padding:10px 16px;
-}
-.dot{width:12px;height:12px;border-radius:50%}
-.dot.r{background:var(--red)}.dot.y{background:var(--yellow)}.dot.g{background:var(--green)}
-.term-title{color:var(--dim);font-family:var(--mono);font-size:.8rem;margin-left:8px}
-.terminal-body{
-  font-family:var(--mono);font-size:.88rem;line-height:1.8;overflow-x:auto;
-  padding:20px 24px;white-space:pre-wrap;
-}
-.prompt{color:var(--green)}.cmd{color:var(--text)}.out{color:var(--dim)}
-.comment{color:#6e7681}.json-k{color:var(--accent)}.json-v{color:var(--green)}
-.ai-prefix{color:var(--purple)}
-
-section{padding:0 0 60px}
-h2{font-size:1.5rem;margin-bottom:10px}
-h2.center{text-align:center;margin-bottom:28px}
-.lead{color:var(--dim);margin:0 auto 26px;max-width:760px}
-.lead.center{text-align:center}
-.grid{display:grid;gap:18px;grid-template-columns:repeat(3,1fr)}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:22px}
-.card h3{font-size:1rem;margin-bottom:8px}
-.card p{color:var(--dim);font-size:.9rem;line-height:1.55}
-.split{display:grid;gap:20px;grid-template-columns:1fr 1fr}
-.flow{
-  background:var(--panel);border:1px solid var(--border);border-radius:10px;
-  color:var(--dim);font-family:var(--mono);font-size:.86rem;line-height:2;
-  overflow-x:auto;padding:24px 28px;white-space:pre;
-}
-.hl{color:var(--accent)}
-
-.insight{
-  background:var(--panel);border-left:3px solid var(--accent);
-  border-radius:0 10px 10px 0;
-  color:var(--dim);font-size:.95rem;line-height:1.7;
-  margin:0 0 40px;padding:20px 24px;
-}
-.insight strong{color:var(--text);font-weight:500}
-
-.vs{display:grid;gap:0;grid-template-columns:1fr 1fr;margin:0 0 40px}
-.vs-col{padding:20px 24px;font-family:var(--mono);font-size:.85rem;line-height:1.9}
-.vs-col:first-child{
-  background:var(--panel);border:1px solid var(--border);border-radius:10px 0 0 10px;
-  border-right:none;
-}
-.vs-col:last-child{
-  background:var(--panel2);border:1px solid var(--border);border-radius:0 10px 10px 0;
-}
-.vs-label{
-  font-family:var(--sans);font-size:.75rem;text-transform:uppercase;
-  letter-spacing:.08em;margin-bottom:10px;display:block;
-}
-.vs-col:first-child .vs-label{color:var(--red)}
-.vs-col:last-child .vs-label{color:var(--green)}
-
-.links{text-align:center;padding-bottom:76px}
-.links a{
-  border:1px solid var(--border);border-radius:8px;display:inline-block;
-  font-weight:500;margin:0 8px;padding:11px 26px;
-}
-.links .primary{background:var(--accent);border-color:var(--accent);color:var(--bg)}
-.links .secondary{background:var(--panel);color:var(--text)}
-
-footer{border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;padding:24px 0;text-align:center}
-
-@media(max-width:760px){
-  .hero h1{font-size:2.2rem}
-  .tagline{font-size:1rem}
-  .install{flex-direction:column}
-  .grid,.split,.vs{grid-template-columns:1fr}
-  .vs-col:first-child{border-radius:10px 10px 0 0;border-right:1px solid var(--border);border-bottom:none}
-  .vs-col:last-child{border-radius:0 0 10px 10px}
-  .terminal-body,.flow{font-size:.78rem;padding:16px}
-  .thesis{font-size:.85rem}
-}
+body { font-family: serif; max-width: 680px; margin: 2em auto; padding: 0 1em; line-height: 1.6; }
+h1 { font-size: 1.6em; }
+h2 { font-size: 1.2em; margin-top: 2em; }
+pre { background: #f5f5f5; border: 1px solid #ddd; padding: 1em; overflow-x: auto; }
+code { font-size: 0.95em; }
+table { border-collapse: collapse; }
+td, th { border: 1px solid #ccc; padding: 4px 10px; text-align: left; }
+hr { border: none; border-top: 1px solid #ccc; margin: 2em 0; }
 </style>
 </head>
 <body>
-<main>
-<div class="container">
 
-<!-- ═══ HERO ═══ -->
-<section class="hero">
-  <h1><span class="accent">agent-tty</span></h1>
-  <p class="tagline"><strong>exec() killed frame detection.</strong><br>AI gets pure data through a pipe. Humans get a real terminal with colors and readline. Same namespace. Python-native runtime.</p>
-  <div class="thesis">
-    <span class="x">parse ANSI escape sequences</span><br>
-    <span class="x">guess when a command finished</span><br>
-    <span class="x">strip terminal control codes</span><br>
-    <span class="k">exec(src) &rarr; return value &rarr; done</span>
-  </div>
-  <div class="install">
-    <code id="install-cmd">pip install agent-tty</code>
-    <button class="copy-btn" onclick="navigator.clipboard.writeText('pip install agent-tty').then(()=>{this.textContent='copied';setTimeout(()=>this.textContent='copy',1400)})">copy</button>
-  </div>
-  <p class="meta">Python 3.10+ &middot; stdlib core, pywinpty on Windows &middot; POSIX PTY / WinPTY / socket fallback &middot; CLI: <code>k</code></p>
-</section>
+<h1>pythond</h1>
 
-<!-- ═══ DEMO ═══ -->
-<div class="terminal">
-  <div class="terminal-bar">
-    <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
-    <span class="term-title">agent workflow</span>
-  </div>
-  <div class="terminal-body"><span class="comment"># start the runtime</span>
-<span class="prompt">$ </span><span class="cmd">k daemon</span>
-<span class="out">k daemon pid=12345 /tmp/k.sock mode=pty</span>
+<p><b>sshd gives you a shell. pythond gives you Python.</b></p>
 
-<span class="comment"># one persistent Python namespace</span>
-<span class="prompt">$ </span><span class="cmd">k new work</span>
-<span class="out">OK work pid=12346</span>
+<p>Persistent Python daemon with named sessions. Code in, result out.
+Variables, connections, and threads survive between calls.
+Agents send code through WebSocket. Humans attach with a real terminal.
+Same namespace.</p>
 
-<span class="prompt">$ </span><span class="cmd">k run work "x = 41"</span>
-<span class="prompt">$ </span><span class="cmd">k run work "x + 1"</span>
-<span class="out">42</span>
+<pre>pip install pythond</pre>
 
-<span class="comment"># long tasks return immediately</span>
-<span class="prompt">$ </span><span class="cmd">k fire work "import time; time.sleep(10); result = x * 2"</span>
-<span class="out">{<span class="json-k">"cell_id"</span>: <span class="json-v">"a1b2c3d4e5f6"</span>, <span class="json-k">"status"</span>: <span class="json-v">"fired"</span>}</span>
+<p>Python 3.10+. Three commands:</p>
 
-<span class="comment"># assignment — no stdout; result lives in the variable</span>
-<span class="prompt">$ </span><span class="cmd">k poll work</span>
-<span class="out">{<span class="json-k">"cell_id"</span>: <span class="json-v">"a1b2c3d4e5f6"</span>, <span class="json-k">"status"</span>: <span class="json-v">"done"</span>, <span class="json-k">"output"</span>: <span class="json-v">""</span>}</span>
+<table>
+<tr><th>Command</th><th>Role</th><th>Like</th></tr>
+<tr><td><code>pythond</code></td><td>daemon</td><td>sshd</td></tr>
+<tr><td><code>pysh</code></td><td>session client</td><td>ssh</td></tr>
+<tr><td><code>pyctl</code></td><td>daemon control</td><td>systemctl</td></tr>
+</table>
 
-<span class="prompt">$ </span><span class="cmd">k run work "result"</span>
-<span class="out">84</span></div>
-</div>
+<h2>Quick start</h2>
 
-<!-- ═══ WRITE FILE → EXEC ═══ -->
-<section>
-  <h2>Write files, then exec</h2>
-  <p class="lead">Complex code with quotes, f-strings, SQL, or shell variables? Write a file with your shell tool, then load it. No manual escaping. The file is transport; the namespace is the workspace.</p>
-  <div class="terminal inline">
-    <div class="terminal-bar">
-      <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
-      <span class="term-title">recommended pattern</span>
-    </div>
-    <div class="terminal-body"><span class="comment"># your agent writes complex code to a file (no escaping needed)</span>
-<span class="prompt">$ </span><span class="cmd">cat > /tmp/task.py &lt;&lt; 'EOF'</span>
-<span class="cmd">config = json.load(open("settings.json"))</span>
-<span class="cmd">config["rate_limit"] = 100</span>
-<span class="cmd">Path("settings.json").write_text(json.dumps(config, indent=2))</span>
-<span class="cmd">print(f"rate_limit set to {config['rate_limit']}")</span>
-<span class="cmd">EOF</span>
+<pre>
+# terminal 1
+pythond daemon
 
-<span class="comment"># then loads it into the live session</span>
-<span class="prompt">$ </span><span class="cmd">k run work "exec(open('/tmp/task.py').read())"</span>
-<span class="out">rate_limit set to 100</span></div>
-  </div>
-  <div class="insight">The session remembers <code>config</code>. The next cell can read or change it. The file was just transport &mdash; the namespace is the workspace.</div>
-</section>
+# terminal 2
+pysh new work
+pysh run work "x = 42"
+pysh run work "x + 1"
+# 43
 
-<!-- ═══ TWO CHANNELS ═══ -->
-<section>
-  <h2 class="center">Two channels, one namespace</h2>
-  <p class="lead center">Your agent's commands enter through a structured pipe: source code in, captured output out. Humans attach through a real PTY: readline, tab completion, arrow keys, colors. Both paths share the same live Python process.</p>
-  <div class="split">
-    <div class="terminal small">
-      <div class="terminal-bar">
-        <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
-        <span class="term-title">AI channel &mdash; pipe</span>
-      </div>
-      <div class="terminal-body"><span class="comment"># structured JSON protocol</span>
-<span class="comment"># no ANSI, no colors, no control codes</span>
-<span class="comment"># pure data in, pure data out</span>
+pysh attach work          # human REPL, Ctrl-] to detach
+</pre>
 
-<span class="prompt">$ </span><span class="cmd">k run work "len(users)"</span>
-<span class="out">1847</span>
+<h2>State persists</h2>
 
-<span class="prompt">$ </span><span class="cmd">k run work "server.healthy()"</span>
-<span class="out">True</span>
+<pre>
+pysh run work "import sqlite3; db = sqlite3.connect('app.db')"
 
-<span class="prompt">$ </span><span class="cmd">k status work</span>
-<span class="out">{<span class="json-k">"state"</span>:<span class="json-v">"idle"</span>,<span class="json-k">"running"</span>:<span class="json-v">[]</span>,<span class="json-k">"vars"</span>:<span class="json-v">12</span>,<span class="json-k">"cells"</span>:<span class="json-v">3</span>}</span></div>
-    </div>
-    <div class="terminal small">
-      <div class="terminal-bar">
-        <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
-        <span class="term-title">human channel &mdash; real PTY</span>
-      </div>
-      <div class="terminal-body"><span class="prompt">$ </span><span class="cmd">k attach work</span>
-<span class="out">shared with AI. Ctrl-] detaches. exit() kills session.</span>
-<span class="out">&gt;&gt;&gt; users<span style="color:var(--yellow)">[</span>TAB<span style="color:var(--yellow)">]</span></span>
-<span class="out">users.keys()  users.values()  users.items()</span>
-<span class="out">&gt;&gt;&gt; </span>
-<span class="ai-prefix">[ai] &gt;&gt;&gt; </span><span class="out">blocked.add("1.2.3.4")</span>
-<span class="ai-prefix">[ai] &gt;&gt;&gt; </span><span class="out">print(f"{len(blocked)} IPs blocked")</span>
-<span class="out">42 IPs blocked</span>
-<span class="out">&gt;&gt;&gt; len(blocked)</span>
-<span class="out">42</span></div>
-    </div>
-  </div>
-</section>
+# ... 100 turns later ...
 
-<!-- ═══ STATEFUL FIRST ═══ -->
-<section>
-  <h2 class="center">Stateful first</h2>
-  <p class="lead center"><code>bash_tool</code> is curl &mdash; every call forks a process, runs, and dies. <code>k</code>&nbsp;is a socket &mdash; one process stays alive, and every call is a function invocation inside it.</p>
-  <div class="vs">
-    <div class="vs-col">
-      <span class="vs-label">subprocess.run &times; 100</span>
-fork &rarr; exec &rarr; connect &rarr; run &rarr; die
-fork &rarr; exec &rarr; connect &rarr; run &rarr; die
-fork &rarr; exec &rarr; connect &rarr; run &rarr; die
-<span style="color:var(--dim)">&hellip;97 more times</span>
+pysh run work "db.execute('SELECT count(*) FROM users').fetchone()"
+# (42,)
+</pre>
 
-<span style="color:var(--red)">~15 seconds of overhead</span>
-each call pays the full startup cost
-nothing survives between calls</div>
-    <div class="vs-col">
-      <span class="vs-label">k run &times; 100</span>
-exec(src) &rarr; return
-exec(src) &rarr; return
-exec(src) &rarr; return
-<span style="color:var(--dim)">&hellip;97 more times</span>
+<p>The connection never closed. The namespace is the workspace.</p>
 
-<span style="color:var(--green)">~0.15 seconds of overhead</span>
-one process, one namespace
-imports, connections, state persist</div>
-  </div>
-  <div class="insight"><strong>Humans avoid state.</strong> State means cleanup, crash recovery, leaked resources. So human tools default to stateless &mdash; fork, run, die. But your agent isn't afraid of state. State is memory. Memory means it doesn't repeat work, doesn't re-parse configs, doesn't re-open connections. <code>subprocess.run</code> is amnesia. <code>k run</code> is accumulation.</div>
-</section>
+<h2>Async execution</h2>
 
-<!-- ═══ CARDS ═══ -->
-<section>
-  <h2 class="center">What stays alive</h2>
-  <p class="lead center">Some things only exist in process memory. A database connection, a TCP socket, an SSH tunnel, a trained model, a Flask app serving requests in a daemon thread, a CDP browser session &mdash; none of these can be serialized to disk. <code>subprocess.run</code> kills them every call. <code>k run</code> keeps them alive. The process is the workspace.</p>
-  <div class="grid">
-    <div class="card">
-      <h3>Variables and imports</h3>
-      <p>A <code>pandas</code> DataFrame, a trained model, a parsed config, a compiled regex &mdash; anything in the namespace survives across cells.</p>
-    </div>
-    <div class="card">
-      <h3>Connections and servers</h3>
-      <p>Database handles, HTTP sessions, WebSocket connections, Flask apps running in daemon threads &mdash; open once, use from every cell.</p>
-    </div>
-    <div class="card">
-      <h3>Live control plane</h3>
-      <p>Feature flags, rate limits, firewall sets, routing weights become Python variables. Patch one cell; the next request sees it. No restart.</p>
-    </div>
-    <div class="card">
-      <h3>Broadcast</h3>
-      <p>When your agent runs a cell, humans see it prefixed with <code>[ai] &gt;&gt;&gt;</code> on the PTY. Two-way visibility &mdash; nobody works blind.</p>
-    </div>
-    <div class="card">
-      <h3>Async cells</h3>
-      <p><code>k fire</code> queues background work. <code>k poll</code> checks the result. The session keeps running. Multiple sessions for parallelism.</p>
-    </div>
-    <div class="card">
-      <h3>Single Python runtime</h3>
-      <p>Core runtime is Python stdlib. The process owns the session directly. <code>pywinpty</code> gives raw WinPTY on Windows &mdash; without it, a socket console works fine.</p>
-    </div>
-  </div>
-</section>
+<pre>
+# fire: thread, shares namespace
+pysh fire work "model = train(X, y)"
+pysh poll work abc123
+# {"cell_id":"abc123", "status":"done", "output":"..."}
+pysh run work "model.score(X_test)"       # model is there
 
-<!-- ═══ TURING COMPLETE ═══ -->
-<section>
-  <h2>The REPL is Turing complete</h2>
-  <p class="lead">You don't need a built-in file watcher, a notification framework, or a monitor callback. The session is Python. Python can do anything. Give your agent the primitives; it builds the rest.</p>
-  <div class="terminal inline">
-    <div class="terminal-bar">
-      <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
-      <span class="term-title">your agent builds its own monitor</span>
-    </div>
-    <div class="terminal-body"><span class="comment"># start a long task</span>
-<span class="prompt">$ </span><span class="cmd">k fire work "train_model(epochs=50)"</span>
-<span class="out">{<span class="json-k">"cell_id"</span>: <span class="json-v">"c7d8e9f0a1b2"</span>, <span class="json-k">"status"</span>: <span class="json-v">"fired"</span>}</span>
+# fork: child process (POSIX only), killable, pickles vars back
+pysh fork work "results = expensive_search(params)"
+pysh int work                              # SIGKILL the fork (POSIX)
+</pre>
 
-<span class="comment"># poll from outside until done</span>
-<span class="prompt">$ </span><span class="cmd">k poll work c7d8e9f0a1b2</span>
-<span class="out">{<span class="json-k">"cell_id"</span>: <span class="json-v">"c7d8e9f0a1b2"</span>, <span class="json-k">"status"</span>: <span class="json-v">"running"</span>, <span class="json-k">"output"</span>: <span class="json-v">""</span>}</span>
+<h2>Remote</h2>
 
-<span class="comment"># or: set up a watcher inside the session</span>
-<span class="prompt">$ </span><span class="cmd">k run work "
-import threading
-def on_done():
-    while not training_complete:
-        time.sleep(5)
-    open('/tmp/done', 'w').write('finished')
-threading.Thread(target=on_done, daemon=True).start()
-"</span></div>
-  </div>
-  <div class="insight"><strong>Frameworks provide features. A REPL provides physics.</strong> Every feature is a subset of what a Turing-complete session can express. <code>k</code> gives your agent <code>fire</code> + <code>poll</code> as primitives. Complex workflows are code, not configuration.</div>
-</section>
+<p>AI agents can't hold SSH sessions open. The local daemon holds
+the connection the agent can't hold.</p>
 
-<!-- ═══ REPL TIPS ═══ -->
-<section>
-  <h2 class="center">REPL patterns</h2>
-  <div class="grid">
-    <div class="card">
-      <h3>Kill the prefix tax</h3>
-      <p><code>from os import *</code> &mdash; now <code>listdir(".")</code> instead of <code>os.listdir(".")</code>. Every token your agent saves is money saved.</p>
-    </div>
-    <div class="card">
-      <h3>Print tax is zero</h3>
-      <p>Expressions display automatically. <code>k run w "len(data)"</code> prints the result. No <code>print()</code> wrapper needed for the last expression.</p>
-    </div>
-    <div class="card">
-      <h3>Hot reload</h3>
-      <p><code>exec(open("module.py").read())</code> or <code>importlib.reload(m)</code> &mdash; update code without restarting the session or losing state.</p>
-    </div>
-    <div class="card">
-      <h3>Incremental execution</h3>
-      <p>Break a long script into cells. If step 3 crashes, fix and re-run just step 3 &mdash; steps 1 and 2's state is still in the namespace.</p>
-    </div>
-    <div class="card">
-      <h3>Catch, fix, retry</h3>
-      <p>Exception in a cell? Read the traceback, fix the function, run again &mdash; all in the same session. State and data survive the error. No restart.</p>
-    </div>
-    <div class="card">
-      <h3>Shell via Python</h3>
-      <p>Need the host OS? <code>subprocess.run(["git","status"], capture_output=True, text=True).stdout</code> &mdash; host commands return clean strings inside the session.</p>
-    </div>
-  </div>
-  <div class="terminal inline">
-    <div class="terminal-bar">
-      <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
-      <span class="term-title">persistent bash inside persistent python</span>
-    </div>
-    <div class="terminal-body"><span class="comment"># start a long-lived bash with a helper to send commands</span>
-<span class="prompt">$ </span><span class="cmd">k run work "exec(open('/tmp/persistent_shell.py').read())"</span>
-<span class="out">persistent bash pid=976 ready. use sh('command')</span>
+<pre>
+# server
+pip install pythond
+pyctl start --listen 0.0.0.0:7399 --tls --show-token
+# prints token and cert fingerprint
 
-<span class="comment"># bash state persists across agent turns</span>
-<span class="prompt">$ </span><span class="cmd">k run work "print(sh('cd /tmp &amp;&amp; pwd'))"</span>
-<span class="out">/tmp</span>
-<span class="prompt">$ </span><span class="cmd">k run work "print(sh('pwd'))"</span>
-<span class="out">/tmp</span>
-<span class="comment"># ↑ remembered &mdash; cd persisted</span></div>
-  </div>
-  <p class="insight">Need bash? It's a subprocess. Need node? Same. Need gdb? Same. The Python session is the host. Everything else lives inside it.</p>
-</section>
+# client: self-signed server cert must be pinned before connecting
+# copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
+pyctl pin ~/server_cert.pem
+pythond daemon
+pyctl connect work 10.0.0.5:7399 &lt;token&gt; --tls
+pysh run work "import platform; platform.node()"
+# remote-host-01
+</pre>
 
-<!-- ═══ COMMAND MAP ═══ -->
-<section>
-  <h2 class="center">Commands</h2>
-  <div class="flow"><span class="hl">k daemon</span> [--show-token]   start daemon in foreground
-<span class="hl">k stop</span>                    stop daemon gracefully
-<span class="hl">k new</span> &lt;name&gt;              create a Python session
-<span class="hl">k int</span> &lt;name&gt;              interrupt running async cells
-<span class="hl">k kill</span> &lt;name&gt;             terminate session
-<span class="hl">k run</span> &lt;name&gt; "code"       sync eval/exec, raw output
-<span class="hl">k fire</span> &lt;name&gt; "code"      async eval/exec, JSON cell_id
-<span class="hl">k poll</span> &lt;name&gt; [cell_id]   JSON cell result
-<span class="hl">k status</span> &lt;name&gt;           JSON session state
-<span class="hl">k vars</span> &lt;name&gt;             JSON namespace names
-<span class="hl">k complete</span> &lt;name&gt; "text"  JSON tab completions
-<span class="hl">k ls</span>                      list sessions
-<span class="hl">k attach</span> &lt;name&gt;           human REPL (Ctrl-] to detach)
-<span class="hl">k --version|-V|version</span>    print version
+<h3>mTLS plus token</h3>
 
-TCP mode writes <span class="hl">daemon.json</span> for local token discovery.
-Shutdown removes that metadata file.
-Tokens are printed only with <span class="hl">k daemon --show-token</span>.
-Only one auto-discoverable TCP daemon owns <span class="hl">daemon.json</span>.
-<span class="hl">K_TOKEN</span> and <span class="hl">K_PORT</span> remain overrides.
-See <a href="https://github.com/rangersui/agent-tty/blob/main/README.md">README</a>.</div>
-</section>
+<pre>
+# client: generate client cert
+pyctl cert
+# copy client ~/.pythond/tls/cert.pem to server as ~/client_cert.pem
 
-<!-- ═══ LINKS ═══ -->
-<section class="links">
-  <a class="primary" href="https://github.com/rangersui/agent-tty">GitHub</a>
-  <a class="secondary" href="https://pypi.org/project/agent-tty/">PyPI</a>
-  <a class="secondary" href="https://github.com/rangersui/agent-tty/blob/main/README.md">Docs</a>
-</section>
+# server: generate server cert, then trust client cert
+pyctl cert
+# copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
+pyctl trust ~/client_cert.pem
+pyctl start --listen 0.0.0.0:7399 --tls --show-token
+# cert is required and token is still required
 
-</div>
-</main>
-<footer>
-  <div class="container">agent-tty by <a href="https://github.com/rangersui">Ranger Chen</a> &middot; <a href="https://agent-tty.sh">agent-tty.sh</a></div>
-</footer>
+# client: pin server cert, then connect (client cert sent automatically)
+pyctl pin ~/server_cert.pem
+pythond daemon
+pyctl connect work 10.0.0.5:7399 &lt;token&gt; --tls
+pysh run work "x"
+</pre>
+
+<h2>Write file, then exec</h2>
+
+<p>Complex code with quotes, f-strings, or SQL? Write a file, load it.
+No escaping.</p>
+
+<pre>
+cat &gt; /tmp/task.py &lt;&lt; 'EOF'
+import pandas as pd
+df = pd.read_csv("data.csv")
+print(f"rows: {len(df)}, cols: {list(df.columns)}")
+EOF
+
+pysh run work "exec(open('/tmp/task.py').read())"
+</pre>
+
+<h2>Two channels, one namespace</h2>
+
+<pre>
+Agent channel (pysh run):       Human channel (pysh attach):
+  code in, text out               real PTY, readline, colors
+  no ANSI, no parsing             tab completion, Ctrl-C
+  WebSocket protocol              Ctrl-] to detach
+           \                     /
+            same Python namespace
+</pre>
+
+<h2>Commands</h2>
+
+<pre>
+pysh new &lt;name&gt;              create session
+pysh run &lt;name&gt; "code"       sync exec, raw output
+pysh fire &lt;name&gt; "code"      async thread, shares namespace (can't kill C code)
+pysh fork &lt;name&gt; "code"      async process (POSIX), killable, pickles vars back
+pysh poll &lt;name&gt; [cell_id]   check async result
+pysh attach &lt;name&gt;           human REPL
+pysh int &lt;name&gt;              interrupt (fire=best effort, fork=kill)
+pysh kill &lt;name&gt;             terminate session
+pysh ls                      list sessions
+pysh status &lt;name&gt;           JSON health
+pysh vars &lt;name&gt;             JSON namespace names
+pysh complete &lt;name&gt; "text"  JSON completion candidates
+
+pyctl start [--listen H:P] [--tls] [--show-token]  start daemon
+pyctl stop                           stop daemon
+pyctl status                         daemon endpoint metadata and liveness
+pyctl connect &lt;name&gt; &lt;h:p&gt; &lt;tok&gt; [--tls]  proxy to remote
+pyctl disconnect &lt;name&gt;             drop remote
+pyctl cert                           show/generate TLS cert
+pyctl trust &lt;cert.pem&gt;              authorize client
+pyctl pin &lt;cert.pem&gt;                verify server
+</pre>
+
+<p><code>pyctl cert</code> prints the certificate path, key path,
+fingerprint, and role hints: copy this cert to the server for
+<code>pyctl trust</code> when this machine is a client, or copy it to the
+client for <code>pyctl pin</code> when this machine is a server.</p>
+
+<h2>Protocol</h2>
+
+<p>WebSocket text frames. First line = command. After newline = code body.
+Python code is never JSON-escaped.</p>
+
+<pre>
+ws.send("run work\nprint('hello')")    # "hello"
+ws.send("fire work\ntrain(epochs=50)") # {"cell_id":"..."}
+ws.send("ls")                          # "  work: alive"
+</pre>
+
+<h2>Security</h2>
+
+<p>The security model mirrors SSH:</p>
+
+<table>
+<tr><th>pythond</th><th>SSH equivalent</th></tr>
+<tr><td>token in <code>daemon.json</code></td><td>private key in <code>~/.ssh/</code></td></tr>
+<tr><td><code>pyctl trust cert.pem</code></td><td>adding a line to <code>authorized_keys</code></td></tr>
+<tr><td><code>pyctl pin cert.pem</code></td><td>adding a line to <code>known_hosts</code></td></tr>
+<tr><td>authenticated client</td><td>logged-in user</td></tr>
+</table>
+
+<p>Once authenticated, a client has full access to all sessions &mdash; no per-session permission isolation. Same as SSH: once you log in, you are that user with all their permissions.</p>
+
+<p>Not a sandbox: code runs with the daemon user's OS permissions.</p>
+
+<table>
+<tr><th>Mode</th><th>Auth</th></tr>
+<tr><td>Local POSIX</td><td>AF_UNIX socket, mode 0o600</td></tr>
+<tr><td>Local Windows</td><td>TCP + token, OWNER RIGHTS DACL (owner-level isolation, comparable to Unix chmod 700)</td></tr>
+<tr><td>Remote</td><td>pinned self-signed TLS cert + token; optional mTLS client cert</td></tr>
+</table>
+
+<p>Access logs are written as <code>ACCESS</code> lines to runtime <code>access.log</code>
+and mirrored to daemon stderr for supervisors. They include <code>conn_id</code>, peer,
+<code>cmd</code>, session, status, and <code>body_bytes</code>; they do not include tokens
+or Python code bodies.</p>
+
+<p>Interactive <code>pysh run/fire/fork</code> also echoes submitted code, errors,
+and raw <code>run</code> output to the client terminal's stderr. That is operator
+feedback, not daemon access logging.</p>
+
+<p>Session names are lowercase only: <code>a-z</code>, <code>0-9</code>,
+underscore, and hyphen, up to 80 characters. Windows reserved device names such
+as <code>CON</code>, <code>NUL</code>, <code>COM1</code>, and <code>LPT1</code>
+are rejected.</p>
+
+<p>Like shell history and environment variables under SSH, pythond session
+history, logs, and live namespaces can expose secrets. <code>history.py</code>
+and <code>session.log</code> may contain executed Python source and captured
+output. Do not paste API keys, passwords, tokens, or other secrets into cells
+unless you are willing for them to persist in that session and its local files.</p>
+
+<h2>Platform</h2>
+
+<table>
+<tr><th>Platform</th><th>PTY</th><th>Transport</th></tr>
+<tr><td>Linux / macOS / WSL</td><td>pty.openpty()</td><td>AF_UNIX WebSocket</td></tr>
+<tr><td>Windows</td><td>pywinpty</td><td>TCP WebSocket</td></tr>
+</table>
+
+<h2>Dependencies</h2>
+
+<table>
+<tr><th>Package</th><th>Role</th></tr>
+<tr><td>websockets</td><td>protocol transport</td></tr>
+<tr><td>wsproto</td><td>raw WSS client framing</td></tr>
+<tr><td>cryptography</td><td>TLS cert generation and pinning</td></tr>
+<tr><td>pywinpty</td><td>Windows PTY (Windows only)</td></tr>
+</table>
+
+<hr>
+
+<p>
+<a href="https://github.com/rangersui/pythond">Source</a> &middot;
+<a href="https://pypi.org/project/pythond/">PyPI</a> &middot;
+MIT license
+</p>
+
 </body>
 </html>

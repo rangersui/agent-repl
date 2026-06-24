@@ -75,18 +75,36 @@ jobs:
       - name: Install wheel
         run: python -m pip install dist/*.whl
 
-      - name: CLI smoke
+      - name: Verify installed wheel import
         run: |
-          k --help >/dev/null
-          k --version
+          tmp="$(mktemp -d)"
+          cd "$tmp"
+          python - <<'PY'
+          import pathlib
+          import pythond
+          path = pathlib.Path(pythond.__file__).resolve()
+          print(path)
+          assert "agent-repl" not in str(path), path
+          assert "site-packages" in str(path) or "dist-packages" in str(path), path
+          PY
 
-      - name: PTY regression suite
-        if: runner.os != 'Windows'
-        run: python3 -B tests/test_pty_posix.py
+      - name: CLI smoke — pythond
+        run: |
+          pythond --help >/dev/null
+          pythond --version
 
-      - name: Windows TCP regression suite
-        if: runner.os == 'Windows'
-        run: python -B tests/test_tcp_windows.py
+      - name: CLI smoke — pysh
+        run: |
+          pysh --help >/dev/null
+          pysh --version
+
+      - name: CLI smoke — pyctl
+        run: |
+          pyctl --help >/dev/null
+          pyctl --version
+
+      - name: Test suite
+        run: python -B test_pythond.py
 
   publish:
     name: Publish to PyPI

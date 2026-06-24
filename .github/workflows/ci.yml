@@ -35,7 +35,7 @@ jobs:
         run: python -m pip install --upgrade pip build twine
 
       - name: Compile check
-        run: python -B -m py_compile agent_tty.py k.py.template tests/test_pty_posix.py tests/test_tcp_windows.py
+        run: python -B -m py_compile pythond.py test_pythond.py
 
       - name: Build distributions
         run: python -m build
@@ -46,19 +46,29 @@ jobs:
       - name: Install wheel
         run: python -m pip install --force-reinstall dist/*.whl
 
-      - name: CLI smoke
+      - name: CLI smoke — pythond
         run: |
-          k --help >/dev/null
-          k --version
+          pythond --help >/dev/null
+          pythond --version
 
-  test-posix:
-    name: POSIX PTY test (${{ matrix.os }})
+      - name: CLI smoke — pysh
+        run: |
+          pysh --help >/dev/null
+          pysh --version
+
+      - name: CLI smoke — pyctl
+        run: |
+          pyctl --help >/dev/null
+          pyctl --version
+
+  test:
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.12"]
     steps:
       - uses: actions/checkout@v6
@@ -69,24 +79,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: PTY regression suite
-        run: python3 -B tests/test_pty_posix.py
-
-  test-windows:
-    name: Windows TCP test
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install Windows dependencies
+      - name: Install dependencies
         run: python -m pip install -e .
 
-      - name: TCP regression suite
-        run: python -B tests/test_tcp_windows.py
+      - name: Test suite
+        run: python -B test_pythond.py

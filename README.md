@@ -1,99 +1,64 @@
-# agent-tty
+# pythond
 
-Persistent Python runtime for your AI agent.
+**sshd gives you a shell. pythond gives you Python.**
 
-Each session is a long-lived Python namespace in a child process. Agent cells
-enter that namespace through `eval`/`exec`, so imports, variables, open
-connections, servers, and in-memory decisions survive across agent turns.
+Persistent Python daemon with named sessions, WebSocket protocol, and human attach.
+Connect to a live Python namespace — variables, connections, threads still running from last time.
 
-`bash_tool` is curl: every call forks a process, runs, and dies. `k` is a
-socket: one process stays alive, and every call is a function invocation inside
-it. The agent sends source code through a structured pipe and receives captured
-output. Humans attach through a real terminal with readline, tab completion,
-colors, and Ctrl-C. Both channels share the same namespace.
-
-Requires Python 3.10+.
-
-Install the CLI:
-
-```bash
-python -m pip install agent-tty
-k --version
+```
+pip install pythond
 ```
 
-After install, `k` is the complete CLI. Do not edit `k`.
-
-From a source checkout, install editable once so `k` resolves to this tree:
+## Quick start
 
 ```bash
-python -m pip install -e .
-k --version
+# Terminal 1: start daemon
+pythond daemon
+
+# Terminal 2: use it
+pysh new work
+pysh run work "x = 42"
+pysh run work "x + 1"          # → 43 (state persists)
+pysh attach work               # → real Python REPL (Ctrl-] to detach)
 ```
 
-The code help is the single source of truth:
+## Three commands
 
-```bash
-k --help
+| Command | Role | Analogy |
+|---------|------|---------|
+| `pythond` | daemon process | `sshd` |
+| `pysh` | session client | `ssh` |
+| `pyctl` | daemon control | `systemctl` |
+
+## Commands
+
+```
+pysh new <name>              create session
+pysh run <name> "code"       sync exec → raw output
+pysh fire <name> "code"      async (thread) → shares namespace, can't kill C
+pysh fork <name> "code"      async process (POSIX only) → killable, pickles vars back
+pysh poll <name> [cell_id]   check async result
+pysh attach <name>           human REPL (readline, colors, Ctrl-C)
+pysh int <name>              best-effort interrupt (fire=best effort, fork=kill)
+pysh kill <name>             terminate session
+pysh ls                      list sessions
+pysh status <name>           session health (JSON)
+pysh vars <name>             namespace names (JSON)
+pysh complete <name> "text"  tab completion (JSON)
+
+pyctl start [--listen HOST:PORT] [--tls]   start daemon in foreground
+pyctl stop                                 stop daemon
+pyctl status                               daemon info
+pyctl connect <name> <host:port> <token> [--tls]   proxy to remote pythond
+pyctl disconnect <name>                            drop remote proxy
+pyctl cert                                 show/generate machine cert
+pyctl trust <cert.pem>                     let this client connect (server-side)
+pyctl pin <cert.pem>                       verify this server is real (client-side)
 ```
 
-## Quick Start
-
-Start the daemon in one terminal:
-
-```bash
-k daemon
-```
-
-Stop the daemon with `k stop` from a client terminal, or `Ctrl-C` in the daemon
-terminal. Daemon shutdown terminates owned sessions, closes the control socket,
-and removes TCP `daemon.json` metadata.
-
-Use the client from another terminal:
-
-```bash
-k new work
-k run work "x = 41"
-k run work "x + 1"
-# 42
-```
-
-Async cells:
-
-```bash
-k fire work "import time; time.sleep(2); y = x + 1"
-# {"cell_id": "a1b2c3d4e5f6", "status": "fired"}
-
-k poll work a1b2c3d4e5f6
-# {"cell_id": "a1b2c3d4e5f6", "status": "done", "output": ""}
-
-k run work "y"
-# 42
-```
-
-Human attach:
-
-```bash
-k attach work
-```
-
-On PTY and WinPTY sessions, `Ctrl-]` detaches and leaves the session alive.
-`exit()` exits the session process. On socket-console sessions, ending stdin
-detaches.
-
-## Runtime Model
-
-`k daemon` runs a foreground daemon. The daemon owns named session processes
-and a local control socket.
-
-Each session is a Python process with:
-
-- one persistent namespace,
-- one execution lock,
-- one cell table for async `fire` results,
-- one human attach surface.
-
-AI commands use a separate control path and share the same namespace as the
-human console.
+Session names are canonical lowercase: `a-z`, `0-9`, `_`, or `-`, 1-80
+characters. Names with uppercase letters or dots are rejected. Windows device
+names such as `con`, `nul`, `prn`, `aux`, `com1`, and `lpt1` are also rejected.
 
 ## Stateful First
 
@@ -102,7 +67,7 @@ for humans, but wasteful for agents. Agents repeat imports, reopen connections,
 re-parse configs, and rebuild intermediate data because the process disappears
 after every call.
 
-agent-tty flips that default. The process is the workspace. State is not a
+pythond flips that default. The process is the workspace. State is not a
 cleanup problem first; it is addressable memory.
 
 Things that stay alive:
@@ -124,86 +89,250 @@ The agent channel is structured: source code in, captured text/JSON out. It does
 not need to parse ANSI escape sequences, cursor movement, prompts, or screen
 redraws to know when a cell finished.
 
-The human channel is interactive: `k attach` connects to the same process
-through PTY, WinPTY, or socket-console mode. A human can inspect variables,
-interrupt with Ctrl-C, or detach with `Ctrl-]` without discarding the namespace.
+The human channel is interactive: `pysh attach` connects to the same process
+through PTY or WinPTY. A human can inspect variables, interrupt with Ctrl-C, or
+detach with `Ctrl-]` without discarding the namespace.
 
 That split is the core design: pure data for agents, real terminal ergonomics
 for humans, one shared runtime underneath.
 
-## Session Modes
+## Why pythond exists
 
-agent-tty uses the best local console surface available:
+```
+pysh run work "x = 42"
+pysh run work "x + 1"    # → 43
+```
 
-| mode | platform | human attach |
-| --- | --- | --- |
-| POSIX PTY | Linux, macOS, WSL | raw terminal, readline, tab, arrows, Ctrl-C |
-| WinPTY | Windows with `pywinpty` | raw terminal through WinPTY |
-| socket console | fallback | line-based `InteractiveConsole` over local TCP |
+Code in, result out. Variables survive between calls.
+No terminal. No ANSI. No parsing. Function-call API to a persistent Python namespace.
 
-PTY and WinPTY sessions support `Ctrl-]` to detach while the Python session
-keeps running. `exit()` exits the session process. Socket-console sessions
-detach when stdin ends.
+AI agents use it as their Python runtime. Humans use `pysh attach` for an interactive REPL into the same namespace. Both see the same objects.
 
-## Default Work Surface
+## Why two daemons (remote proxy)
 
-Default to the live session for project work. Once a daemon/session exists,
-commands that affect the task should go through `k run` or `k fire`, even when
-the command is as simple as `ls`, `pwd`, or `git status`.
+AI can't ssh. A human would `ssh server` then `python -i` — done. An AI agent can only do one-shot `bash_tool` calls, so it can't hold an SSH session open.
 
-That keeps the work in one inspectable runtime: cwd changes, environment
-mutations, imports, open sockets, cached data, and command history all stay
-with the session the human can attach to.
+The two-daemon pattern solves this: the local daemon holds the connection the AI can't hold. `pyctl connect` tells the local daemon to proxy to a remote daemon. By default the proxy name is also the remote session name, so remote use looks local: `pyctl connect work ...` then `pysh run work "code"`. For advanced routing, use explicit proxy form: `pysh run server work "code"`.
 
-Use the host shell as plumbing:
+## fire vs fork
 
-- start or stop the daemon,
-- write larger Python cells to files before loading them,
-- inspect or repair the repository when no session is available.
+Both run code asynchronously. The difference is the execution model.
 
-Inside the session, call host commands through Python:
+```
+pysh fire work "model = train(data)"    # thread — shares namespace
+pysh fork work "model = train(data)"    # process — killable, pickles back
+```
+
+**fire** (threading.Thread): Code runs in a thread that shares the session namespace. Exec is serialized (one cell at a time) — async to the client, not parallel. Variables set by fire'd code are immediately visible to later calls. Cannot be force-killed when stuck in C code (requests.get, time.sleep). `pysh kill` (whole session) is the escape.
+
+**fork** (`os.fork()`, POSIX only): Code runs in a child process with a copy of the namespace. New/changed variables are pickled back and merged when done. `pysh int` kills it (SIGKILL). Unpicklable objects (sockets, locks, CUDA tensors) are skipped -- the poll response tells you what didn't come back. In-place mutations (`list.append`, `dict[k]=v`) won't merge -- use assignment (`x = new_value`). Failed forks do not merge. Merge is last-writer-wins: a completed fork may overwrite variables changed in the parent while running.
+
+```json
+// poll after fork completes
+{"cell_id": "abc", "status": "done", "output": "...",
+ "merged": ["model", "results"], "skipped": ["db_conn"]}
+```
+
+## Protocol
+
+WebSocket with newline-separated fields. Python code is never JSON-escaped.
+
+```
+ws.send("run work\nprint('hello')")     → "hello"
+ws.send("fire work\ntrain(epochs=50)")  → {"cell_id":"..."}
+ws.send("fork work\ntrain(epochs=50)")  → {"cell_id":"..."}
+ws.send("ls")                           → "  work: alive pid=123"
+```
+
+The protocol supports multiple commands on one WebSocket. The normal `pysh`
+CLI opens a short connection per command; `pyctl connect` keeps a remote proxy
+connection alive inside the local daemon.
+
+## Transport
+
+| Mode | URL | Auth | Use case |
+|------|-----|------|----------|
+| Local POSIX | `ws://` over AF_UNIX | socket perms | default |
+| Local Windows | `ws://127.0.0.1:7399` | token | default |
+| Remote | `wss://host:7399` | token plus pinned self-signed server cert; optionally mTLS | `--listen --tls` |
+
+## Remote access
 
 ```bash
-k run work "import subprocess; subprocess.run(['git', 'status'])"
+# Server
+pip install pythond
+pyctl start --listen 0.0.0.0:7399 --tls --show-token
+# prints token and fingerprint
+
+# Client: copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem.
+# Remote TLS uses a self-signed cert, so pin before connecting.
+pyctl pin ~/server_cert.pem
+export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=abc... PYTHOND_TLS=1
+pysh new work
+pysh run work "import platform; platform.node()"
 ```
 
-## Command Reference
-
-```text
-k daemon [--show-token]   start daemon in foreground
-k stop                    stop daemon gracefully
-k new <name>              create a Python session
-k int <name>              interrupt running async cells
-k kill <name>             terminate session process and forget it
-k run <name> "code"       sync Python eval/exec, print raw output
-k fire <name> "code"      async queued eval/exec, print JSON cell_id
-k poll <name> [cell_id]   print JSON cell result
-k status <name>           print JSON session state
-k vars <name>             print JSON list of public namespace names
-k complete <name> "text"  print JSON Python completion candidates
-k ls                      list sessions
-k attach <name>           attach human REPL to the session
-k --version|-V|version    print version
-```
-
-`k new <name>` creates a Python session. Put host commands inside Python cells
-with `subprocess`:
+### mTLS plus token
 
 ```bash
-k run work "import subprocess; subprocess.run(['git', 'status'])"
+# Client: generate client cert
+pyctl cert
+# copy client ~/.pythond/tls/cert.pem to server as ~/client_cert.pem
+
+# Server: generate server cert, trust client cert
+pyctl cert
+pyctl trust ~/client_cert.pem
+# copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
+pyctl start --listen 0.0.0.0:7399 --tls --show-token
+# cert is required and token is still required
+
+# Client: pin server cert, then connect (client cert sent automatically)
+pyctl pin ~/server_cert.pem
+export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=<printed-token> PYTHOND_TLS=1
+pysh run work "x"
 ```
 
-For larger code, write a Python file and load it into the live session:
+### SSH tunnel
 
 ```bash
-cat > /tmp/agent_tty_task.py << 'PY'
-import subprocess
-result = subprocess.run(["git", "status"], text=True, capture_output=True)
-print(result.stdout)
-PY
-
-k run work "exec(open('/tmp/agent_tty_task.py').read())"
+ssh -L 7399:localhost:7399 user@server "pythond daemon --listen 127.0.0.1:7399 --show-token"
+# local:
+export PYTHOND_HOST=127.0.0.1:7399 PYTHOND_TOKEN=<printed-token>
+pysh run work "x"
 ```
+
+## Remote proxy
+
+Local daemon maintains connection to remote daemon. Agent just talks to local.
+
+```bash
+pythond daemon                                    # local daemon
+pyctl connect work 10.0.0.5:7399 <token> --tls    # proxy alias = remote session
+pysh run work "x = 42"                            # forwarded to remote work
+pysh run work "x"                                 # → 42 (remote state)
+pyctl disconnect work
+```
+
+One local proxy can also address a different remote session explicitly:
+
+```bash
+pyctl connect server 10.0.0.5:7399 <token> --tls  # proxy alias
+pysh run server gpu "x = 42"                      # remote session = gpu
+```
+
+## Auto-checkpoint
+
+Successful synchronous `run` cells are saved to `~/.pythond/sessions/<name>/history.py`.
+Successful async `fire`/`fork` cells are saved when `poll` observes completion.
+Errors go to `session.log` but not `history.py`.
+
+Like shell history and environment variables under SSH, pythond session history,
+logs, and live namespaces can expose secrets. `history.py` and `session.log` may
+contain executed Python source and captured output. Variables assigned in a
+session remain in that live Python process until overwritten or the session is
+killed. Do not paste API keys, passwords, tokens, or other secrets into cells
+unless you are willing for them to persist in that session and its local files.
+
+```bash
+# Process died? Replay:
+pysh new work
+pysh run work "exec(open(os.path.expanduser('~/.pythond/sessions/work/history.py')).read())"
+```
+
+## Security
+
+The security model mirrors SSH:
+
+| pythond | SSH equivalent |
+|---------|---------------|
+| token in `daemon.json` | private key in `~/.ssh/` |
+| `pyctl trust cert.pem` | adding a line to `authorized_keys` |
+| `pyctl pin cert.pem` | adding a line to `known_hosts` |
+| authenticated client | logged-in user |
+
+Once authenticated, a client has full access to all sessions — there is no per-session permission isolation. This is the same as SSH: once you log in, you are that user with all their permissions.
+
+- **Not a sandbox**: code runs with the daemon user's OS permissions
+- **Local POSIX**: AF_UNIX socket with `0o600` permissions
+- **Local Windows**: OWNER RIGHTS DACL via `icacls` — owner-level isolation (comparable to Unix `chmod 700`)
+- **Remote**: pinned self-signed TLS cert + token auth, with optional mTLS client cert
+- **Access logs**: daemon writes `ACCESS` lines to runtime `access.log` and mirrors them to daemon stderr for supervisors; logs include `conn_id`, peer, `cmd`, session, status, and `body_bytes`, but never token or code body
+- **Crash isolation**: 5-layer try/except + process isolation — exec errors never kill daemon
+
+## Operations
+
+Run the daemon in the foreground under your supervisor:
+
+```bash
+pythond daemon
+# or
+pyctl start --listen 0.0.0.0:7399 --tls
+```
+
+Operational signals:
+
+```bash
+pyctl status          # daemon endpoint metadata and liveness
+pysh ls               # sessions known to the daemon
+pysh status work      # one session's worker health
+pyctl stop            # graceful daemon shutdown
+```
+
+Logs:
+
+- `ACCESS ...` lines are mirrored to daemon stderr for systemd/supervisor/journald.
+- The same access events are appended to the runtime `access.log`.
+- Interactive `pysh run/fire/fork` also echoes submitted code, errors, and raw
+  `run` output to the client terminal's stderr. That is operator feedback, not
+  daemon access logging.
+- Per-session activity goes to `~/.pythond/sessions/<name>/session.log`.
+- Successful replayable sync execs go to `~/.pythond/sessions/<name>/history.py`.
+- Successful async execs go there when `poll` observes completion.
+
+Access logs are for daemon operations: connection id, peer, cmd, session,
+status, and body size. They deliberately do not record tokens or Python source.
+Use `session.log` when you need the executed code and output.
+
+Runtime files and durable state live in different places:
+
+| Purpose | Windows | POSIX |
+|---------|---------|-------|
+| daemon metadata/logs | `%LOCALAPPDATA%\pythond\daemon.json`, `%LOCALAPPDATA%\pythond\access.log` | `$XDG_RUNTIME_DIR/pythond/` or `/tmp/pythond-$UID/` |
+| session state/certs | `~\.pythond\sessions\...`, `~\.pythond\tls\...` | `~/.pythond/sessions/...`, `~/.pythond/tls/...` |
+
+## Cross-platform
+
+| Platform | PTY | Transport | Notes |
+|----------|-----|-----------|-------|
+| Linux/macOS | `pty.openpty()` | AF_UNIX WS | full featured |
+| Windows | `pywinpty` | TCP WS | `pip install pywinpty` |
+| WSL | same as Linux | AF_UNIX WS | full featured |
+
+## Architecture
+
+```
+agent (one-shot bash_tool)
+  ↓ ws://unix socket or wss://tcp
+daemon process (WebSocket server, keep-alive connections)
+  ├── session "work" (subprocess, isolated)
+  │     ├── persistent namespace (variables live forever)
+  │     ├── AI channel: JSON lines over socketpair
+  │     └── human channel: real PTY (readline, colors)
+  ├── session "gpu" (another subprocess)
+  └── remote "server" (WebSocket proxy to remote daemon)
+```
+
+## Design
+
+**exec() is the core insight.** Old agent-terminal tools parse ANSI escape sequences
+from TTY byte streams to detect when commands finish. pythond uses `exec(code, namespace)` —
+source code in, captured output out, function call semantics. No ANSI parsing. No frame detection.
+
+**Connection ≠ state.** SSH conflates them — disconnect kills the shell. pythond separates
+them — the WebSocket is transport, the namespace is state. Disconnect and reconnect; state survives.
+
+**Write-file-then-exec.** Complex code with quotes and f-strings? Write a file, then
+`exec(open('/tmp/task.py').read())`. The file is transport; the namespace is the workspace.
 
 ## REPL Patterns
 
@@ -221,12 +350,6 @@ operations:
   same namespace.
 - Host commands: use `subprocess.run(..., capture_output=True, text=True)` from
   inside the session when you need the OS.
-- Persistent subprocess: need a long-lived bash, node, or gdb? Start it with
-  `Popen` and keep it in the namespace. State accumulates across agent turns.
-
-The REPL is Turing complete. File watchers, completion callbacks, local
-monitors, proxy servers, and control loops do not need to be built into
-agent-tty; the session can build them as Python code.
 
 ### Persistent subprocess
 
@@ -235,7 +358,7 @@ persistent Python REPL gives you shell state (cd, env vars, aliases) that
 survives across agent turns:
 
 ```bash
-k run work "
+pysh run work "
 from subprocess import Popen, PIPE, STDOUT
 import queue, threading, time
 
@@ -261,151 +384,40 @@ def sh(cmd, timeout=5):
 Now bash state persists:
 
 ```bash
-k run work "print(sh('cd /tmp && pwd'))"
+pysh run work "print(sh('cd /tmp && pwd'))"
 # /tmp
 
-k run work "print(sh('pwd'))"
+pysh run work "print(sh('pwd'))"
 # /tmp  ← cd persisted
 
-k run work "print(sh('export SECRET=hunter2'))"
-k run work "print(sh('echo \$SECRET'))"
+pysh run work "print(sh('export SECRET=hunter2'))"
+pysh run work "print(sh('echo \$SECRET'))"
 # hunter2  ← env var persisted
 ```
 
 The same pattern works for any interactive subprocess: node, gdb, redis-cli,
 psql. The Python session is the host; everything else lives inside it.
 
-## Output Formats
-
-Each command has a fixed output style:
-
-| command | format | shape |
-| --- | --- | --- |
-| `k daemon` | process | foreground daemon; startup line on stderr |
-| `k stop` | text | `OK stopping daemon` or `ERR ...` |
-| `k new` | text | `OK <name> pid=<pid> ...` or `ERR ...` |
-| `k int` | text | `OK interrupted <name> (N cells)` or `ERR ...` |
-| `k kill` | text | `OK killed <name>` or `ERR ...` |
-| `k ls` | text | one line per session, or `(no sessions)` |
-| `k run` | raw text | captured stdout/stderr from the cell |
-| `k fire` | JSON | `{"cell_id":"...","status":"fired"}` |
-| `k poll` | JSON | `{"cell_id":"...","status":"running|done|error","output":"..."}` |
-| `k status` | JSON | `{"state":"idle|running","running":[],"vars":N,"cells":N}` |
-| `k vars` | JSON | `{"vars":["name", ...]}` |
-| `k complete` | JSON | `{"matches":["os.path", ...]}` |
-| `k attach` | stream | interactive console |
-| `k --version` | text | `agent-tty 0.2.1`; aliases: `k -V`, `k version` |
-
-`k run` prints expression results like a Python REPL: strings print as raw text;
-other values use `repr`.
-
-Assignments usually produce no output:
-
-```bash
-k run work "x = 1"
-# empty output
-```
-
-Expressions print:
-
-```bash
-k run work "x + 1"
-# 2
-```
-
-## Async Cells
-
-`fire` starts a background cell and returns immediately. Cells inside one
-session execute serially under the session lock. Create multiple sessions for
-parallel work.
-
-```bash
-k new a
-k new b
-k fire a "import time; time.sleep(5); result = 'A'"
-k fire b "import time; time.sleep(5); result = 'B'"
-```
-
-`poll` with a cell id returns that cell. `poll` without a cell id returns the
-most recent cell in the session, or `{"status":"idle"}` if no cells exist.
-
-## Transport
-
-AF_UNIX mode uses `K_SOCK`, defaulting to `/tmp/k.sock`.
-
-TCP mode uses `127.0.0.1:K_PORT` (default 7399) and token authentication.
-Native Windows uses TCP mode. The daemon writes private daemon metadata for
-local clients:
-
-```text
-k daemon pid=12345 127.0.0.1:7399 mode=winpty meta=...\daemon.json
-```
-
-The metadata file lets a new terminal run `k ls` without setting `K_TOKEN`.
-Shutdown removes the metadata file.
-
-| platform | metadata path |
-| --- | --- |
-| Windows | `%LOCALAPPDATA%\agent-tty\daemon.json` |
-| POSIX TCP | `$XDG_RUNTIME_DIR/agent-tty/daemon.json` |
-| POSIX TCP fallback | `/tmp/agent-tty-$UID/daemon.json` |
-
-Only one auto-discoverable TCP daemon can own `daemon.json` at a time. Starting
-a second TCP daemon while the metadata file points to a live daemon fails loud
-instead of replacing the first daemon's token.
-
-`K_TOKEN` and `K_PORT` remain explicit overrides for debugging or unusual
-shells. Use `k daemon --show-token` only when you deliberately want shell setup
-text printed to stderr:
-
-```text
-k daemon --show-token
-set K_TOKEN=abc123...
-export K_TOKEN=abc123...
-```
-
-Attach uses the same token lookup in TCP mode, so `k attach` works from another
-terminal after the daemon metadata file exists.
-
-In a source checkout, `k.py.template` is an optional debug wrapper for storing a
-local daemon token:
-
-```bash
-cp k.py.template k.py
-# paste K_TOKEN and K_PORT into k.py if you want a fixed-token wrapper
-python k.py ls
-python k.py new work
-```
-
-`k.py` is listed in `.gitignore` because it contains a live local daemon token.
-
-On Windows, WinPTY mode requires `pywinpty`. With `pywinpty` available the daemon
-prints `mode=winpty`; otherwise it falls back to `mode=socket`.
-
 ## Tests
 
 Static syntax check:
 
 ```bash
-python -B -m py_compile agent_tty.py k.py.template tests/test_pty_posix.py tests/test_tcp_windows.py
+python -B -m py_compile pythond.py test_pythond.py
 ```
 
-POSIX PTY regression suite:
+Run test suite:
 
 ```bash
-python3 -B tests/test_pty_posix.py
+python -B test_pythond.py
 ```
 
-The POSIX suite starts a daemon with a Unix socket, creates a PTY session, and
-checks `new`, `ls`, `run`, `fire`, `poll`, `status`, `complete`, and `kill`.
+## Dependencies
 
-Windows TCP regression suite:
-
-```powershell
-python -B tests/test_tcp_windows.py
+```
+pythond              websockets, wsproto, cryptography, pywinpty (Windows only)
 ```
 
-The Windows suite starts a daemon on loopback TCP, verifies daemon.json token
-discovery without startup token leakage, then exercises the real CLI client
-path. It works with WinPTY when `pywinpty` is installed and with socket-console
-fallback otherwise.
+## License
+
+MIT

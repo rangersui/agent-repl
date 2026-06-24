@@ -1,4 +1,4 @@
-# agent-tty is POSIX-only — all files LF, no CRLF drift.
+# pythond — all files LF, no CRLF drift.
 # Windows editors (and core.autocrlf=true) must not inject \r.
 
 * text=auto eol=lf

@@ -928,8 +928,9 @@ def test_connection_hardening_static():
     resize_seg = src[src.index("def _handle_resize("):src.index("def _handle_ls(")]
     attach_reader_seg = src[src.index("def _attach_reader("):src.index("def _attach_ws_loop(")]
     attach_loop_seg = src[src.index("def _attach_ws_loop("):src.index("def _attach_ws_pty(")]
-    attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _mp_init(")]
+    attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _worker_entry(")]
     connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
+    add_session_subparsers_seg = src[src.index("def _add_session_subparsers("):src.index("def main(")]
     client_start = src.index("def client(")
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
@@ -1063,10 +1064,8 @@ def test_connection_hardening_static():
     check("fork monitor clears pid immediately after waitpid",
           "os.waitpid(pid, 0)" in fork_monitor_seg and
           "pass  # already reaped\n            r[\"pid\"] = None" in fork_monitor_seg)
-    check("fork monitor clears pid in finally",
-          "finally:\n                r[\"status\"] = \"done\"\n"
-          "                r[\"_done_at\"] = time.time()\n"
-          "                r[\"pid\"] = None" in fork_monitor_seg)
+    check("fork monitor clears pid once",
+          fork_monitor_seg.count("r[\"pid\"] = None") == 1)
     check("fork monitor handles unexpected result failures",
           "(fork result read failed)" in fork_monitor_seg and
           "except Exception:" in fork_monitor_seg)
@@ -1078,7 +1077,8 @@ def test_connection_hardening_static():
     check("fork closes fds on fork failure",
           "for fd in (r_fd, w_fd):" in dispatch_seg)
     check("namespace reads are lock-protected",
-          "with lock:" in dispatch_seg and "ns_snapshot = dict(ns)" in dispatch_seg)
+          "def _locked(" in src and "def _public_names(" in src and
+          "with _locked(lock):" in dispatch_seg and "ns_snapshot = dict(ns)" in dispatch_seg)
     check("int is serialized and ctypes is module-level",
           "with _INTERRUPT_LOCK:" in dispatch_seg and
           "import ctypes" not in dispatch_seg)
@@ -1132,19 +1132,19 @@ def test_connection_hardening_static():
           "_daemon_server = server\n        server.serve_forever()" not in daemon_full_seg)
     check("daemon clears token on shutdown",
           "_daemon_token = None" in daemon_full_seg)
-    check("mp init only on daemon entry points",
-          main_seg.count("_mp_init()") == 1 and
-          "if args.command == \"daemon\":\n        _mp_init()" in main_seg and
-          "_mp_init()" not in pysh_seg and
-          pyctl_seg.count("_mp_init()") == 1 and
-          "if args.command == \"start\":\n        _mp_init()" in pyctl_seg)
+    check("multiprocessing init removed",
+          "_mp_init" not in src and "import multiprocessing" not in src)
     check("entry points use argparse",
           "import argparse" in src and
           "argparse.ArgumentParser" in main_seg and
           "argparse.ArgumentParser" in pysh_seg and
           "argparse.ArgumentParser" in pyctl_seg)
+    check("session subparsers are shared",
+          "def _add_session_subparsers(" in src and
+          "_add_session_subparsers(sub)" in main_seg and
+          "_add_session_subparsers(sub)" in pysh_seg)
     check("pysh run accepts remote proxy target session",
-          "p_cmd.add_argument(\"code\", nargs=argparse.REMAINDER)" in pysh_seg)
+          "p_cmd.add_argument(\"code\", nargs=argparse.REMAINDER)" in add_session_subparsers_seg)
     check("manual help strings removed",
           "_PYSH_HELP" not in src and "_PYCTL_HELP" not in src)
     check("remote resize fails explicitly",

@@ -117,7 +117,6 @@ import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile, co
 import argparse
 import select
 import signal, subprocess
-import multiprocessing as mp
 import pickle
 import secrets
 import hmac
@@ -135,7 +134,6 @@ from wsproto.utilities import LocalProtocolError
 
 __version__ = "0.3.0"
 JsonDict = dict[str, typing.Any]
-MaybeJson = JsonDict | str
 WebSocketLike = typing.Any
 SocketLike = typing.Any
 _WS_PROTO: typing.Any = f"pythond.{__version__[:3]}"   # e.g. "pythond.0.3"
@@ -1004,6 +1002,18 @@ def _write_all(fd: int, data: bytes) -> None:
             raise OSError("pipe write returned 0")
         view = view[n:]
 
+@contextlib.contextmanager
+def _locked(lock: threading.Lock | None) -> typing.Iterator[None]:
+    if lock is None:
+        yield
+    else:
+        with lock:
+            yield
+
+def _public_names(ns: JsonDict, lock: threading.Lock | None) -> list[str]:
+    with _locked(lock):
+        return [v for v in ns if not v.startswith("_")]
+
 def _dispatch(
     cmd: str,
     args: list[str],
@@ -1196,10 +1206,7 @@ def _dispatch(
                     if r["_error"]:
                         merged = {}
                     else:
-                        if lock:
-                            with lock:
-                                ns.update(merged)
-                        else:
+                        with _locked(lock):
                             ns.update(merged)
                     r["_merged"] = list(merged.keys())
                     r["_skipped"] = data.get("skipped", [])
@@ -1221,7 +1228,6 @@ def _dispatch(
             finally:
                 r["status"] = "done"
                 r["_done_at"] = time.time()
-                r["pid"] = None
         with _cells_lock:
             cells[cid] = res
             _evict_stale_cells(cells)
@@ -1300,12 +1306,7 @@ def _dispatch(
             resp["skipped"] = r["_skipped"]
         return resp
     elif cmd == "status":
-        if lock:
-            with lock:
-                public_names = [v for v in ns if not v.startswith("_")]
-        else:
-            public_names = [v for v in ns if not v.startswith("_")]
-        vs = len(public_names)
+        vs = len(_public_names(ns, lock))
         with _cells_lock:
             _evict_stale_cells(cells)
             running = [cid for cid, r in cells.items()
@@ -1314,19 +1315,11 @@ def _dispatch(
         return {"state": "running" if running else "idle",
                 "running": running, "vars": vs, "cells": ncells}
     elif cmd == "vars":
-        if lock:
-            with lock:
-                public_names = [v for v in ns if not v.startswith("_")]
-        else:
-            public_names = [v for v in ns if not v.startswith("_")]
-        return {"vars": public_names}
+        return {"vars": _public_names(ns, lock)}
     elif cmd == "complete":
         import rlcompleter
         text = args[0] if args else ""
-        if lock:
-            with lock:
-                ns_snapshot = dict(ns)
-        else:
+        with _locked(lock):
             ns_snapshot = dict(ns)
         c = rlcompleter.Completer(ns_snapshot)
         matches: list[str] = []
@@ -1764,13 +1757,6 @@ def _close_session_resources(s: JsonDict) -> bool:
                     handle.close()
             except OSError:
                 pass  # cleanup must not raise -- resources may already be dead
-    else:
-        if s["proc"].is_alive():
-            s["proc"].terminate()
-            s["proc"].join(timeout=3)
-            if s["proc"].is_alive():
-                s["proc"].kill()
-                s["proc"].join(timeout=1)
     return True
 
 def _monitor_session(name: str) -> None:
@@ -1784,8 +1770,6 @@ def _monitor_session(name: str) -> None:
                 s["winpty"].wait()
             elif "proc" in s:
                 s["proc"].wait()
-        else:
-            s["proc"].join()
     except Exception as e:
         print(f"WARN: session {name} exited abnormally: {e}",
               file=sys.stderr)
@@ -1848,15 +1832,7 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
                     s["ai"].settimeout(None)
                 except OSError:
                     pass  # socket may be dead
-        else:
-            if not s["proc"].is_alive():
-                return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
-            s["tx"].send(msg)
-            if s["rx"].poll(timeout):
-                result: dict[str, typing.Any] = s["rx"].recv()
-                return result
-            return {"error": "timeout -- cell may still be running; "
-                    "use pysh int or pysh kill if stuck"}
+        return {"error": f"unsupported session type: {s.get('type')}"}
 
 # -----------------------------------------------
 # REMOTE PROXY -- persistent TCP to remote daemon
@@ -2404,6 +2380,9 @@ def _log_cell_poll(name: str, resp: JsonDict, exec_error: bool) -> None:
             _log_history(name, src)
 
 
+def _command_source(args: list[str]) -> str:
+    return args[-1] if args else ""
+
 def _handle_session_command(cmd: str, args: list[str]) -> str:
     if not args:
         return "ERR need session name"
@@ -2418,9 +2397,9 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
                 inner_args = [inner_args[0], " ".join(inner_args[1:])]
         else:
             inner_args = [" ".join(inner_args)]
-    if cmd in ("run", "fire", "fork") and inner_args:
-        code_str = inner_args[-1] if s["type"] == "remote" else inner_args[0]
-        lines = code_str.strip().splitlines()
+    src = _command_source(inner_args) if cmd in ("run", "fire", "fork") else ""
+    if src:
+        lines = src.strip().splitlines()
         pfx = f"{name}>>> " if len(_session_snapshot()) > 1 else ">>> "
         cont = "." * len(pfx.rstrip()) + " "
         for i, ln in enumerate(lines):
@@ -2431,13 +2410,11 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
 
     exec_error = bool(resp.pop("_error", False))
     if cmd == "run" and inner_args and "error" not in resp:
-        src = inner_args[-1] if s["type"] == "remote" else inner_args[0]
         output = resp.get("output", "")
         _log_session(name, src, output, error=exec_error)
         if not exec_error and src.strip():
             _log_history(name, src)
     elif cmd in ("fire", "fork") and inner_args and "error" not in resp:
-        src = inner_args[-1] if s["type"] == "remote" else inner_args[0]
         _log_cell_launch(name, src, resp)
     elif cmd == "poll" and "error" not in resp and resp.get("status") == "done":
         if exec_error:
@@ -3007,12 +2984,6 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
 
     _attach_ws_loop(ws, name, read_input, restore_terminal)
 
-def _mp_init() -> None:
-    try:
-        mp.set_start_method("fork", force=True)
-    except ValueError:
-        pass  # fork not available -- use platform default
-
 def _worker_entry(argv: list[str]) -> bool:
     """Handle internal worker subprocess entry points."""
     if argv[0] == "_worker_pty":
@@ -3039,6 +3010,35 @@ def _worker_entry(argv: list[str]) -> bool:
         session_worker_pty(ai_sock)
         sys.exit(0)
     return False
+
+def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
+    p_attach = sub.add_parser("attach", help="attach terminal to session")
+    p_attach.add_argument("name", nargs="?", default="default")
+    p_new = sub.add_parser("new", help="create session")
+    p_new.add_argument("name")
+    for cname, chelp in (
+        ("run", "sync exec, raw output"),
+        ("fire", "async thread exec"),
+        ("fork", "async process exec"),
+    ):
+        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd.add_argument("name")
+        p_cmd.add_argument("code", nargs=argparse.REMAINDER)
+    p_poll = sub.add_parser("poll", help="check async result")
+    p_poll.add_argument("name")
+    p_poll.add_argument("cell_id", nargs="?")
+    for cname, chelp in (
+        ("int", "interrupt running cells"),
+        ("kill", "terminate session"),
+        ("status", "session health"),
+        ("vars", "namespace names"),
+    ):
+        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd.add_argument("name")
+    sub.add_parser("ls", help="list sessions")
+    p_complete = sub.add_parser("complete", help="tab completions")
+    p_complete.add_argument("name")
+    p_complete.add_argument("text")
 
 def main() -> None:
     """Entry point for `pythond` command -- full command set."""
@@ -3069,34 +3069,7 @@ def main() -> None:
     p_daemon.add_argument("--show-token", action="store_true",
                           help="print auth token")
 
-    p_attach = sub.add_parser("attach", help="attach terminal to session")
-    p_attach.add_argument("name", nargs="?", default="default")
-
-    p_new = sub.add_parser("new", help="create session")
-    p_new.add_argument("name")
-    for cname, chelp in (
-        ("run", "sync exec, raw output"),
-        ("fire", "async thread exec"),
-        ("fork", "async process exec"),
-    ):
-        p_cmd = sub.add_parser(cname, help=chelp)
-        p_cmd.add_argument("name")
-        p_cmd.add_argument("code", nargs=argparse.REMAINDER)
-    p_poll = sub.add_parser("poll", help="check async result")
-    p_poll.add_argument("name")
-    p_poll.add_argument("cell_id", nargs="?")
-    for cname, chelp in (
-        ("int", "interrupt running cells"),
-        ("kill", "terminate session"),
-        ("status", "session health"),
-        ("vars", "namespace names"),
-    ):
-        p_cmd = sub.add_parser(cname, help=chelp)
-        p_cmd.add_argument("name")
-    sub.add_parser("ls", help="list sessions")
-    p_complete = sub.add_parser("complete", help="tab completions")
-    p_complete.add_argument("name")
-    p_complete.add_argument("text")
+    _add_session_subparsers(sub)
 
     if not argv:
         parser.print_help()
@@ -3107,7 +3080,6 @@ def main() -> None:
 
     args = parser.parse_args(argv)
     if args.command == "daemon":
-        _mp_init()
         daemon(show_token=args.show_token, listen_addr=args.listen,
                tls=args.tls)
     elif args.command == "attach":
@@ -3128,33 +3100,7 @@ def pysh_main() -> None:
                         version=f"pythond {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    p_attach = sub.add_parser("attach", help="attach terminal to session")
-    p_attach.add_argument("name", nargs="?", default="default")
-    p_new = sub.add_parser("new", help="create session")
-    p_new.add_argument("name")
-    for cname, chelp in (
-        ("run", "sync exec, raw output"),
-        ("fire", "async thread exec"),
-        ("fork", "async process exec"),
-    ):
-        p_cmd = sub.add_parser(cname, help=chelp)
-        p_cmd.add_argument("name")
-        p_cmd.add_argument("code", nargs=argparse.REMAINDER)
-    p_poll = sub.add_parser("poll", help="check async result")
-    p_poll.add_argument("name")
-    p_poll.add_argument("cell_id", nargs="?")
-    for cname, chelp in (
-        ("int", "interrupt running cells"),
-        ("kill", "terminate session"),
-        ("status", "session health"),
-        ("vars", "namespace names"),
-    ):
-        p_cmd = sub.add_parser(cname, help=chelp)
-        p_cmd.add_argument("name")
-    sub.add_parser("ls", help="list sessions")
-    p_complete = sub.add_parser("complete", help="tab completions")
-    p_complete.add_argument("name")
-    p_complete.add_argument("text")
+    _add_session_subparsers(sub)
 
     if not argv:
         parser.print_help()
@@ -3210,7 +3156,6 @@ def pyctl_main() -> None:
 
     args = parser.parse_args(argv)
     if args.command == "start":
-        _mp_init()
         daemon(show_token=args.show_token, listen_addr=args.listen,
                tls=args.tls)
     elif args.command == "stop":

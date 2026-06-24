@@ -1138,6 +1138,7 @@ def test_connection_hardening_static():
     handle_ls_seg = src[src.index("def _handle_ls("):src.index("def _log_cell_launch(")]
     connect_daemon_seg = src[src.index("def _connect_daemon("):src.index("def _build_wire_message(")]
     add_session_subparsers_seg = src[src.index("def _add_session_subparsers("):src.index("def main(")]
+    default_sock_seg = src[src.index("def _default_sock("):src.index("SOCK =")]
     client_start = src.index("def client(")
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
@@ -1382,6 +1383,11 @@ def test_connection_hardening_static():
           connect_daemon_seg.index("from websockets.sync.client import unix_connect"))
     check("daemon connector validates fallback port",
           "if not (1 <= port <= 65535):" in connect_daemon_seg)
+    check("default socket fallback uses private runtime dir",
+          'f"pythond-{uid}", "pythond.sock"' in default_sock_seg)
+    check("pyctl status honours PYTHOND_HOST",
+          "def _pyctl_env_status(" in src and
+          'if os.environ.get("PYTHOND_HOST"):' in pyctl_seg)
     check("daemon server registered immediately",
           "def _set_server(" in daemon_full_seg and
           "_daemon_server = created" in daemon_full_seg and
@@ -1532,6 +1538,33 @@ def test_pyctl_cert_role_hints():
           "If this machine is the server:" in text and "pyctl pin" in text)
 
 
+def test_pyctl_status_uses_env_endpoint():
+    section("pyctl status uses PYTHOND_HOST")
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+        def send(self, msg):
+            self.sent.append(msg)
+        def recv(self, timeout=None):
+            return "(no sessions)"
+        def close(self):
+            self.closed = True
+
+    fake = FakeWs()
+    with mock.patch.dict(os.environ, {"PYTHOND_HOST": "127.0.0.1:7399"}, clear=False), \
+         mock.patch.object(pythond, "_connect_daemon", return_value=fake), \
+         mock.patch.object(sys, "argv", ["pyctl", "status"]), \
+         mock.patch.object(sys, "stdout", io.StringIO()) as out:
+        pythond.pyctl_main()
+    text = out.getvalue()
+    check("status sent ls", fake.sent == ["ls"], fake.sent)
+    check("status closed ws", fake.closed is True)
+    check("status prints endpoint", "endpoint: 127.0.0.1:7399" in text, text)
+    check("status prints alive true", "alive: True" in text, text)
+
+
 def test_default_sock():
     section("default socket path")
     path = pythond._default_sock()
@@ -1544,7 +1577,10 @@ def test_default_sock():
         if xdg and os.path.isdir(xdg):
             check("prefers XDG_RUNTIME_DIR", path.startswith(xdg))
         else:
-            check("fallback has UID", str(os.getuid()) in path)
+            check("fallback uses private runtime dir",
+                  os.path.basename(path) == "pythond.sock" and
+                  os.path.basename(os.path.dirname(path)) ==
+                  f"pythond-{os.getuid()}")
 
 
 def test_secure_path_win32():
@@ -2476,6 +2512,7 @@ def main():
         test_session_cli_errors_exit_nonzero,
         test_access_log_sanitises_session_field,
         test_pyctl_cert_role_hints,
+        test_pyctl_status_uses_env_endpoint,
         test_default_sock,
         test_secure_path_win32,
 

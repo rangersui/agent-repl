@@ -71,8 +71,9 @@ Security (same model as SSH):
   Remote mTLS:   wss:// + mutual cert verification, plus token.
     pyctl trust  = authorized_keys (server lets client in).
     pyctl pin    = known_hosts (client verifies server).
-  Access logs:   ACCESS lines go to access.log and stderr; they include
-                 conn_id, peer, cmd, session, status, body_bytes, not code.
+  Access logs:   ACCESS lines go to access.log and stderr. Fields are
+                 event-specific; command/result lines include conn_id, peer,
+                 cmd, session, status/body_bytes as applicable, never code.
   Crash containment: per-session worker processes; daemon tries to reap failed sessions.
 
 Auto-checkpoint:
@@ -186,13 +187,13 @@ def _default_sock() -> str:
     """Default AF_UNIX socket path.
 
     Prefers $XDG_RUNTIME_DIR/pythond.sock (/run/user/$UID/, mode 0o700).
-    Falls back to $TMPDIR/pythond-$UID.sock with UID to prevent squatting.
+    Falls back to private $TMPDIR/pythond-$UID/pythond.sock.
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg and os.path.isdir(xdg):
         return os.path.join(xdg, "pythond.sock")
     uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
-    return os.path.join(tempfile.gettempdir(), f"pythond-{uid}.sock")
+    return os.path.join(tempfile.gettempdir(), f"pythond-{uid}", "pythond.sock")
 
 SOCK = os.environ.get("PYTHOND_SOCK", _default_sock())
 
@@ -3399,6 +3400,38 @@ def pysh_main() -> None:
     else:
         client(args.command, argv[1:], fail_on_err=True)
 
+
+def _pyctl_env_status() -> bool:
+    """Print liveness for the daemon selected by PYTHOND_* environment."""
+    endpoint = os.environ.get("PYTHOND_HOST")
+    try:
+        ws = _connect_daemon(timeout=2)
+    except Exception as e:
+        print(f"endpoint: {endpoint}")
+        print("alive: False")
+        print(f"error: {_public_error(e)}")
+        return False
+    try:
+        ws.send("ls")
+        resp = ws.recv(timeout=2)
+        alive = resp is not _WS_CLOSE and not (
+            isinstance(resp, str) and resp.startswith("ERR ")
+        )
+        print(f"endpoint: {endpoint}")
+        print(f"alive: {alive}")
+        return alive
+    except Exception as e:
+        print(f"endpoint: {endpoint}")
+        print("alive: False")
+        print(f"error: {_public_error(e)}")
+        return False
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass  # status probing should not fail because close failed
+
+
 def pyctl_main() -> None:
     """Entry point for `pyctl` command -- daemon management."""
     argv = sys.argv[1:]
@@ -3489,7 +3522,9 @@ def pyctl_main() -> None:
     elif args.command == "status":
         meta = _read_daemon_meta()
         alive = False
-        if _HAS_AF_UNIX:
+        if os.environ.get("PYTHOND_HOST"):
+            alive = _pyctl_env_status()
+        elif _HAS_AF_UNIX:
             alive = _unix_daemon_alive()
             print(f"socket: {SOCK}")
             print(f"alive: {alive}")

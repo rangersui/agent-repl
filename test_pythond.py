@@ -905,6 +905,7 @@ def test_connection_hardening_static():
     runtime_seg = src[src.index("def _runtime_dir("):src.index("def _daemon_meta_path(")]
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
     private_dir_seg = src[src.index("def _ensure_private_dir("):src.index("def _session_dir(")]
+    secure_win_seg = src[src.index("def _secure_path_win32("):src.index("def _runtime_dir(")]
     log_seg = src[src.index("def _log_history("):src.index("# -----------------------------------------------\n# SOCKET helpers")]
     set_session_seg = src[src.index("def _set_session("):src.index("def _ensure_session_capacity(")]
     trust_cert_seg = src[src.index("def trust_cert("):src.index("class _Servable")]
@@ -1013,6 +1014,8 @@ def test_connection_hardening_static():
           "_WIN_FILE_ATTRIBUTE_REPARSE_POINT" in private_dir_seg)
     check("windows path hardening catches icacls timeout",
           "subprocess.TimeoutExpired" in src and "def _secure_path_win32" in src)
+    check("windows path hardening fails closed",
+          "raise RuntimeError(f\"cannot secure directory: {path}\")" in secure_win_seg)
     check("log files are created private",
           "os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT" in log_seg and
           "0o600" in log_seg)
@@ -1023,6 +1026,8 @@ def test_connection_hardening_static():
     check("cert writes are atomic",
           "os.replace(tmp_key, key_path)" in cert_gen_seg and
           "os.replace(tmp_cert, cert_path)" in cert_gen_seg)
+    check("cert partial replace is invalidated",
+          "for fpath in (tmp_key, tmp_cert, key_path, cert_path):" in cert_gen_seg)
     check("self-signed cert is not a CA",
           "BasicConstraints(ca=False" in cert_gen_seg and
           "key_cert_sign=False" in cert_gen_seg and
@@ -1049,10 +1054,15 @@ def test_connection_hardening_static():
     check("posix spawn failure closes fds and sockets",
           "except Exception:\n            for fd in (master_fd, slave_fd):" in new_session_seg and
           "for sock_obj in (ai_parent, ai_child):" in new_session_seg)
+    check("PTY bridge writes all bytes",
+          "lambda d: _write_all(master_fd, d)" in new_session_seg)
     check("kill closes PTY bridge",
           "bridge.close()" in close_session_seg)
     check("fork monitor always marks done",
           "finally:\n                r[\"status\"] = \"done\"" in fork_monitor_seg)
+    check("fork monitor clears pid immediately after waitpid",
+          "os.waitpid(pid, 0)" in fork_monitor_seg and
+          "pass  # already reaped\n            r[\"pid\"] = None" in fork_monitor_seg)
     check("fork monitor clears pid in finally",
           "finally:\n                r[\"status\"] = \"done\"\n"
           "                r[\"_done_at\"] = time.time()\n"
@@ -1164,6 +1174,7 @@ def test_connection_hardening_static():
     check("windows attach clears line and echo input",
           "& ~0x0006" in attach_win_seg)
     check("client prints ERR to stderr",
+          "if resp and resp.startswith(\"ERR \") and fail_on_err:" in client_seg and
           "resp.startswith(\"ERR \")" in client_seg and
           "file=sys.stderr" in client_seg and
           "else sys.stdout" in client_seg)

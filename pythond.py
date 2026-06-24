@@ -407,6 +407,7 @@ def _secure_path_win32(path: str) -> None:
             subprocess.TimeoutExpired) as e:
         print(f"WARN: cannot set DACL on {path}: {e.__class__.__name__}",
               file=sys.stderr)
+        raise RuntimeError(f"cannot secure directory: {path}") from e
 
 def _runtime_dir() -> str:
     """Return the private runtime directory for daemon metadata."""
@@ -649,7 +650,7 @@ def _generate_cert() -> tuple[str, str]:
         os.replace(tmp_key, key_path)
         os.replace(tmp_cert, cert_path)
     except Exception:
-        for fpath in (tmp_key, tmp_cert):
+        for fpath in (tmp_key, tmp_cert, key_path, cert_path):
             with contextlib.suppress(OSError):
                 os.unlink(fpath)
         raise
@@ -1185,6 +1186,7 @@ def _dispatch(
                 os.waitpid(pid, 0)
             except ChildProcessError:
                 pass  # already reaped
+            r["pid"] = None
             try:
                 if chunks:
                     data = pickle.loads(b"".join(chunks))
@@ -1662,7 +1664,7 @@ def new_session(name: str) -> None:
             "ai": ai_parent,
             "bridge": PtyBridge(
                 lambda: os.read(master_fd, 4096),
-                lambda d: os.write(master_fd, d)),
+                lambda d: _write_all(master_fd, d)),
         }
         try:
             _set_session(name, session)
@@ -2809,7 +2811,7 @@ def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
         sys.exit(1)
     if resp:
         print(resp, file=sys.stderr if resp.startswith("ERR ") else sys.stdout)
-    if resp.startswith("ERR ") and fail_on_err:
+    if resp and resp.startswith("ERR ") and fail_on_err:
         sys.exit(1)
 
 def attach(name: str) -> bool:

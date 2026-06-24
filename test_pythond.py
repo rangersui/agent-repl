@@ -6,6 +6,7 @@ Run:  python -B test_pythond.py
 Unit tests run everywhere.  Integration tests need POSIX (PTY) or TCP mode.
 """
 import json
+import io
 import os
 import shutil
 import signal
@@ -220,6 +221,15 @@ def test_make_exec_thread_isolation():
     check("normal capture works", output2.strip() == "normal")
 
 
+def test_thread_stdout_compat_methods():
+    section("_ThreadStdout compat methods")
+    real = io.StringIO()
+    wrapper = pythond._ThreadStdout(real)
+    wrapper.writelines(["a", "b"])
+    check("writelines forwards", real.getvalue() == "ab")
+    check("isatty forwards", wrapper.isatty() is False)
+
+
 def test_dispatch_run():
     section("_dispatch run")
     ns = pythond._init_namespace()
@@ -251,6 +261,7 @@ def test_dispatch_fire_poll():
     check("poll done", resp2["status"] == "done")
     check("poll cell_id", resp2["cell_id"] == cid)
     check("fire set var", ns.get("x") == 99)
+    check("fire cell carries tid key", "tid" in cells[cid])
 
 
 def test_dispatch_poll_empty():
@@ -757,6 +768,13 @@ def test_raw_wss_leftover_and_fragments():
     client = pythond._RawWssClient(FakeSock(frag))
     check("fragmented text assembled", client.recv(timeout=1) == "hello")
 
+    client = pythond._RawWssClient(FakeSock(bytes([0x83, 0])))
+    try:
+        client.recv(timeout=1)
+        check("unknown opcode rejected", False)
+    except RuntimeError as e:
+        check("unknown opcode rejected", "unsupported websocket opcode" in str(e))
+
 
 def test_tls_and_auth_hardening_static():
     section("TLS/auth hardening")
@@ -791,6 +809,9 @@ def test_connection_hardening_static():
     dispatch_seg = src[src.index("def _dispatch("):src.index("# =============================================\n# POSIX: real PTY worker")]
     monitor_seg = src[src.index("def _monitor_session("):src.index("def send_session(")]
     remote_seg = src[src.index("def _send_remote("):src.index("def connect_remote(")]
+    resize_seg = src[src.index("def _handle_resize("):src.index("def _handle_ls(")]
+    attach_reader_seg = src[src.index("def _attach_reader("):src.index("def _attach_ws_loop(")]
+    attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _mp_init(")]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
 
@@ -826,6 +847,8 @@ def test_connection_hardening_static():
     check("close frame has sentinel", "return _WS_CLOSE" in src)
     check("websocket accept value is case-sensitive",
           'header_map.get("sec-websocket-accept", "") != accept' in src)
+    check("unknown websocket opcodes fail closed",
+          "unsupported websocket opcode" in src)
     check("TLS bridge reaps threads", "def _reap_threads" in src and "self._reap_threads()" in src)
     check("TLS accept loop has timeout",
           "self._sock.settimeout(1.0)" in tls_server_seg and
@@ -847,6 +870,13 @@ def test_connection_hardening_static():
     check("worker entry has environment capability",
           "_WORKER_ENV" in main_seg and
           "env={**os.environ, _WORKER_ENV: \"1\"}" in new_session_seg)
+    check("winpty spawn env mutation is locked",
+          "with _WORKER_SPAWN_LOCK:" in new_session_seg)
+    check("winpty listener closes in finally",
+          "finally:\n            ai_srv.close()" in new_session_seg)
+    check("posix spawn failure closes fds and sockets",
+          "except Exception:\n            for fd in (master_fd, slave_fd):" in new_session_seg and
+          "for sock_obj in (ai_parent, ai_child):" in new_session_seg)
     check("kill closes PTY bridge",
           "bridge.close()" in close_session_seg)
     check("fork monitor always marks done",
@@ -867,16 +897,31 @@ def test_connection_hardening_static():
     check("int is serialized and ctypes is module-level",
           "with _INTERRUPT_LOCK:" in dispatch_seg and
           "import ctypes" not in dispatch_seg)
+    check("fire publishes tid after start before cell visibility",
+          "t.start()" in dispatch_seg and
+          "res[\"tid\"] = t.ident" in dispatch_seg and
+          "cells[cid] = res" in dispatch_seg)
     check("latest poll uses explicit cell sequence",
           "\"_seq\": next(_CELL_SEQ)" in dispatch_seg and
           "list(cells)[-1]" not in dispatch_seg)
     check("stale monitor cannot kill replacement",
           "sessions.get(name) is not s" in monitor_seg)
+    check("monitor closes resources under session lock",
+          "with _session_lock(s):" in monitor_seg and
+          "_close_session_resources(s)" in monitor_seg)
     check("timed out command channel stays unhealthy",
           "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
     check("remote does not retry after send",
           "remote response failed" in remote_seg and
+          "remote send failed" in remote_seg and
           "if attempt == 0:\n                    continue" in remote_seg)
+    check("remote resize fails explicitly",
+          "resize not supported for remote sessions" in resize_seg)
+    check("attach reader uses bounded recv",
+          "ws.recv(timeout=2)" in attach_reader_seg and
+          "except (TimeoutError, socket.timeout):" in attach_reader_seg)
+    check("windows attach preserves processed input",
+          "old_in.value | _WIN_ENABLE_PROCESSED_INPUT" in attach_win_seg)
     check("pyctl exits nonzero on ERR",
           "fail_on_err=True" in pyctl_seg)
     check("malformed listen rejected",
@@ -1730,6 +1775,7 @@ def main():
         test_make_exec_error,
         test_make_exec_on_done,
         test_make_exec_thread_isolation,
+        test_thread_stdout_compat_methods,
         test_dispatch_run,
         test_dispatch_fire_poll,
         test_dispatch_poll_empty,

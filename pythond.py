@@ -144,6 +144,7 @@ _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _WS_CLOSE = object()
 _CELL_SEQ = itertools.count()
 _INTERRUPT_LOCK = threading.Lock()
+_WORKER_SPAWN_LOCK = threading.Lock()
 _WORKER_ENV = "PYTHOND_INTERNAL_WORKER"
 _SET_ASYNC_EXC: typing.Any = ctypes.pythonapi.PyThreadState_SetAsyncExc
 _SET_ASYNC_EXC.argtypes = [ctypes.c_ulong, ctypes.py_object]
@@ -731,11 +732,16 @@ class _ThreadStdout:
     def write(self, s: str) -> typing.Any:
         buf = getattr(self._local, "buf", None)
         return (buf or self._real).write(s)
+    def writelines(self, lines: typing.Iterable[str]) -> None:
+        buf = getattr(self._local, "buf", None)
+        (buf or self._real).writelines(lines)
     def flush(self) -> None:
         buf = getattr(self._local, "buf", None)
         (buf or self._real).flush()
     def fileno(self) -> int:
         return self._real.fileno()
+    def isatty(self) -> bool:
+        return self._real.isatty()
     @property
     def encoding(self) -> str:
         return self._real.encoding
@@ -885,7 +891,6 @@ def _dispatch(
         res = {"output": "", "status": "running", "tid": None,
                "_seq": next(_CELL_SEQ)}
         def _bg(c: str = args[0], r: JsonDict = res) -> None:
-            r["tid"] = threading.current_thread().ident
             try:
                 out = _exec(c)
                 r["output"] = str(out)
@@ -897,10 +902,13 @@ def _dispatch(
                 r["status"] = "done"
                 r["_done_at"] = time.time()
                 r["tid"] = None
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
         with _cells_lock:
+            if res["status"] == "running":
+                res["tid"] = t.ident
             cells[cid] = res
             _evict_stale_cells(cells)
-        threading.Thread(target=_bg, daemon=True).start()
         return {"cell_id": cid, "status": "fired"}
     elif cmd == "fork":
         # os.fork() child process, not threading.Thread.
@@ -1396,31 +1404,35 @@ def new_session(name: str) -> None:
         kill_session(name)
     if _HAS_PTY and _WinPty is not None:
         ai_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            ai_srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        ai_srv.bind(("127.0.0.1", 0))
-        ai_port = ai_srv.getsockname()[1]
-        ai_srv.listen(1)
-        ai_srv.settimeout(10)
-        old_worker_env = os.environ.get(_WORKER_ENV)
-        os.environ[_WORKER_ENV] = "1"
         try:
-            proc = _WinPty.spawn(
-                [sys.executable, os.path.abspath(__file__),
-                 "_worker_winpty", str(ai_port)]
-            )
-        finally:
-            if old_worker_env is None:
-                os.environ.pop(_WORKER_ENV, None)
-            else:
-                os.environ[_WORKER_ENV] = old_worker_env
-        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                ai_srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            ai_srv.bind(("127.0.0.1", 0))
+            ai_port = ai_srv.getsockname()[1]
+            ai_srv.listen(1)
+            ai_srv.settimeout(10)
+            with _WORKER_SPAWN_LOCK:
+                old_worker_env = os.environ.get(_WORKER_ENV)
+                os.environ[_WORKER_ENV] = "1"
+                try:
+                    proc = _WinPty.spawn(
+                        [sys.executable, os.path.abspath(__file__),
+                         "_worker_winpty", str(ai_port)]
+                    )
+                finally:
+                    if old_worker_env is None:
+                        os.environ.pop(_WORKER_ENV, None)
+                    else:
+                        os.environ[_WORKER_ENV] = old_worker_env
             ai_conn, _ = ai_srv.accept()
         except socket.timeout:
-            proc.terminate(force=True)
-            ai_srv.close()
+            try:
+                proc.terminate(force=True)
+            except UnboundLocalError:
+                pass
             raise RuntimeError("winpty worker failed to connect")
-        ai_srv.close()
+        finally:
+            ai_srv.close()
         def _read() -> bytes:
             try:
                 return proc.read().encode()
@@ -1440,15 +1452,32 @@ def new_session(name: str) -> None:
         threading.Thread(target=_monitor_session, args=(name,),
                          daemon=True).start()
     elif _HAS_PTY:
-        master_fd, slave_fd = pty.openpty()  # type: ignore[name-defined]
-        ai_parent, ai_child = socket.socketpair()
-        p = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__),
-             "_worker_pty", str(slave_fd), str(ai_child.fileno())],
-            close_fds=True,
-            pass_fds=(slave_fd, ai_child.fileno()),
-            env={**os.environ, _WORKER_ENV: "1"},
-        )
+        master_fd = slave_fd = -1
+        ai_parent = ai_child = None
+        try:
+            master_fd, slave_fd = pty.openpty()  # type: ignore[name-defined]
+            ai_parent, ai_child = socket.socketpair()
+            p = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__),
+                 "_worker_pty", str(slave_fd), str(ai_child.fileno())],
+                close_fds=True,
+                pass_fds=(slave_fd, ai_child.fileno()),
+                env={**os.environ, _WORKER_ENV: "1"},
+            )
+        except Exception:
+            for fd in (master_fd, slave_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            for sock_obj in (ai_parent, ai_child):
+                if sock_obj is not None:
+                    try:
+                        sock_obj.close()
+                    except OSError:
+                        pass
+            raise
         os.close(slave_fd)
         ai_child.close()
         session = {
@@ -1564,11 +1593,12 @@ def _monitor_session(name: str) -> None:
             s["proc"].join()
     except Exception:
         pass  # process exited abnormally -- still need to reap
-    with _sessions_lock:
-        if sessions.get(name) is not s:
-            return
-        sessions.pop(name, None)
-    _close_session_resources(s)
+    with _session_lock(s):
+        with _sessions_lock:
+            if sessions.get(name) is not s:
+                return
+            sessions.pop(name, None)
+        _close_session_resources(s)
 
 def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
     """Send one AI command to a session and wait for its response.
@@ -1783,6 +1813,10 @@ class _RawWssClient:
                     return _WS_CLOSE
                 if opcode == 0x9:
                     self._send_frame(0xA, payload)
+                    continue
+                if opcode == 0xA:
+                    continue
+                raise RuntimeError(f"unsupported websocket opcode: {opcode}")
         finally:
             if timeout is not None:
                 self.sock.settimeout(old_timeout)
@@ -1960,6 +1994,8 @@ def _send_remote(
                 ws.close()
             except Exception:
                 pass  # stale connection -- clear it
+            if attempt == 0:
+                continue
             return {"error": "remote send failed"}
         try:
             resp = ws.recv(timeout=timeout)
@@ -2128,6 +2164,8 @@ def _handle_resize(args: list[str]) -> str:
     s = _get_session(name)
     if s is None:
         return f"ERR no session '{name}'"
+    if s["type"] == "remote":
+        return "ERR resize not supported for remote sessions"
     with _session_lock(s):
         if _get_session(name) is not s:
             return f"ERR no session '{name}'"
@@ -2588,7 +2626,10 @@ def _attach_reader(ws: WebSocketLike, stopped: threading.Event) -> None:
     """WebSocket output -> stdout for both POSIX and Windows attach."""
     try:
         while not stopped.is_set():
-            frame = ws.recv()
+            try:
+                frame = ws.recv(timeout=2)
+            except (TimeoutError, socket.timeout):
+                continue
             if frame is _WS_CLOSE:
                 break
             if isinstance(frame, bytes):
@@ -2680,7 +2721,11 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
     old_out = ctypes.c_uint32()
     kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in))
     kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out))
-    kernel32.SetConsoleMode(stdin_h, _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT)
+    kernel32.SetConsoleMode(
+        stdin_h,
+        old_in.value | _WIN_ENABLE_PROCESSED_INPUT |
+        _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT,
+    )
     kernel32.SetConsoleMode(
         stdout_h,
         old_out.value | _WIN_ENABLE_PROCESSED_OUTPUT |

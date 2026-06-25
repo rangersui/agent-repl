@@ -189,6 +189,7 @@ connection. Default to transparent alias mode: the local proxy name is also the
 remote session name, so the command shape stays local.
 
 ```bash
+# Non-loopback pyctl start/pythond daemon listeners auto-enable TLS.
 # Remote TLS uses a self-signed server cert; pin it before connecting.
 pyctl pin ~/server_cert.pem
 pyctl connect work 10.0.0.5:7984 <token> --tls

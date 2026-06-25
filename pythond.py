@@ -206,7 +206,7 @@ _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
 _MAX_WORKER_RESPONSE = int(os.environ.get("PYTHOND_MAX_WORKER_RESPONSE", str(16 * 1024 * 1024)))
 _MAX_TLS_BRIDGE_THREADS = int(os.environ.get("PYTHOND_MAX_TLS_BRIDGE_THREADS", "256"))
-_TLS_BRIDGE_IO_TIMEOUT = float(os.environ.get("PYTHOND_TLS_BRIDGE_IO_TIMEOUT", "30"))
+_TLS_BRIDGE_IO_TIMEOUT = float(os.environ.get("PYTHOND_TLS_BRIDGE_IO_TIMEOUT", "10"))
 _SESSION_NAME_RE = re.compile(r"^[a-z0-9_-]{1,80}$")
 _WIN_RESERVED_NAME_RE = re.compile(
     r"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\.|$)",
@@ -1038,6 +1038,7 @@ class _TlsTerminatedServer:
         self._trusted_client_dir = trusted_client_dir
         self._inner = ws_serve(handler, "127.0.0.1", 0,
                                subprotocols=subprotocols,
+                               server_header=None,
                                logger=_ws_logger)
         try:
             inner_addr = self._inner.socket.getsockname()
@@ -1061,7 +1062,9 @@ class _TlsTerminatedServer:
             except socket.timeout:
                 continue
             except OSError:
-                break
+                if self._stopped.is_set():
+                    break
+                continue
             if len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS:
                 _access_log("tls", peer=addr, status="capacity-drop",
                             detail="bridge-thread-limit")
@@ -2730,6 +2733,10 @@ def _parse_host_port(value: str, default_port: int = 7984) -> tuple[str, int]:
         raise ValueError("port out of range")
     return host, port
 
+def _is_loopback(host: str) -> bool:
+    """Return whether host is a loopback listen address."""
+    return host in ("127.0.0.1", "localhost", "::1")
+
 
 def _open_remote_ws(
     host: str,
@@ -3186,13 +3193,10 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             raise SystemExit(1)
         use_unix = False
         _use_mtls = False
-        # RCE safety: non-localhost requires TLS
-        if host not in ("127.0.0.1", "localhost", "::1") and not tls:
-            print("ERR: --listen on non-localhost requires --tls (this is RCE)",
-                  file=sys.stderr)
-            print("     use --listen 127.0.0.1:PORT for localhost without TLS",
-                  file=sys.stderr)
-            raise SystemExit(1)
+        # RCE safety: non-loopback listeners are TLS by default.  Loopback can
+        # stay plaintext because it is local-only.
+        if not _is_loopback(host):
+            tls = True
         if tls:
             cert, key = _generate_cert()
             fp = _cert_fingerprint(cert)
@@ -3394,6 +3398,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 server = _set_server(
                     ws_unix_serve(_ws_handler, SOCK,
                                   subprotocols=[_WS_PROTO],
+                                  open_timeout=2,
                                   server_header=None,
                                   logger=_ws_logger)
                 )
@@ -3424,6 +3429,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 server = _set_server(
                     ws_serve(_ws_handler, host, port,
                              subprotocols=[_WS_PROTO],
+                             open_timeout=2,
                              server_header=None,
                              logger=_ws_logger)
                 )
@@ -3436,6 +3442,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             server = _set_server(
                 ws_serve(_ws_handler, "127.0.0.1", port,
                          subprotocols=[_WS_PROTO],
+                         open_timeout=2,
                          server_header=None,
                          logger=_ws_logger)
             )
@@ -3829,7 +3836,7 @@ def main() -> None:
     p_daemon.add_argument("--listen", metavar="HOST:PORT",
                           help="listen address")
     p_daemon.add_argument("--tls", action="store_true",
-                          help="enable TLS")
+                          help="force TLS; non-loopback --listen enables TLS automatically")
     p_daemon.add_argument("--show-token", action="store_true",
                           help="print auth token")
 
@@ -3926,7 +3933,8 @@ def pyctl_main() -> None:
 
     p_start = sub.add_parser("start", help="start daemon")
     p_start.add_argument("--listen", metavar="HOST:PORT")
-    p_start.add_argument("--tls", action="store_true")
+    p_start.add_argument("--tls", action="store_true",
+                         help="force TLS; non-loopback --listen enables TLS automatically")
     p_start.add_argument("--show-token", action="store_true")
     sub.add_parser("stop", help="stop daemon gracefully")
     sub.add_parser("status", help="daemon process info")

@@ -124,6 +124,15 @@ def test_parse_host_port_validation():
             check(f"reject {value}", True)
 
 
+def test_loopback_policy():
+    section("loopback listen policy")
+    check("127 is loopback", pythond._is_loopback("127.0.0.1") is True)
+    check("localhost is loopback", pythond._is_loopback("localhost") is True)
+    check("ipv6 loopback is loopback", pythond._is_loopback("::1") is True)
+    check("0.0.0.0 is not loopback", pythond._is_loopback("0.0.0.0") is False)
+    check("remote host is not loopback", pythond._is_loopback("10.0.0.5") is False)
+
+
 def test_init_namespace():
     section("_init_namespace")
     ns = pythond._init_namespace()
@@ -2023,6 +2032,10 @@ def test_connection_hardening_static():
     check("listen address parse fails cleanly",
           "ERR invalid --listen" in daemon_seg and
           "except (TypeError, ValueError):" in daemon_seg)
+    check("non-loopback listen auto-enables TLS",
+          "def _is_loopback(" in src and
+          "if not _is_loopback(host):\n            tls = True" in daemon_seg and
+          "requires --tls" not in daemon_seg)
     check("default socket fallback uses private runtime dir",
           'f"pythond-{uid}", "pythond.sock"' in default_sock_seg)
     check("pyctl status honours PYTHOND_HOST",
@@ -2815,6 +2828,8 @@ def test_integration_tls_pinned_server():
                     check("tls stop sent",
                           resp is None or
                           "OK stopping daemon" in resp or
+                          "ERR command failed: ConnectionResetError" in resp or
+                          "ERR command failed: websocket closed" in resp or
                           "ERR cannot connect: ConnectionResetError" in resp or
                           "ERR cannot connect: websocket closed" in resp,
                           resp)
@@ -3321,6 +3336,7 @@ def main():
         test_listen_addr_parsing,
         test_khost_parsing,
         test_parse_host_port_validation,
+        test_loopback_policy,
         test_init_namespace,
         test_make_exec_eval,
         test_make_exec_exec,

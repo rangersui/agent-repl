@@ -154,14 +154,15 @@ connection alive inside the local daemon.
 |------|-----|------|----------|
 | Local POSIX | `ws://` over AF_UNIX | socket perms | default |
 | Local Windows | `ws://127.0.0.1:7984` | token | default |
-| Remote | `wss://host:7984` | token plus pinned self-signed server cert; optionally mTLS | `--listen --tls` |
+| Remote | `wss://host:7984` | token plus pinned self-signed server cert; optionally mTLS | non-loopback `--listen` auto-enables TLS |
 
 ## Remote access
 
 ```bash
 # Server
 pip install pythond
-pyctl start --listen 0.0.0.0:7984 --tls --show-token
+pyctl start --listen 0.0.0.0:7984 --show-token
+# Non-loopback --listen auto-enables TLS.
 # prints token and fingerprint
 
 # Client: copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem.
@@ -183,7 +184,8 @@ pyctl cert
 pyctl cert
 pyctl trust ~/client_cert.pem
 # copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
-pyctl start --listen 0.0.0.0:7984 --tls --show-token
+pyctl start --listen 0.0.0.0:7984 --show-token
+# Non-loopback --listen auto-enables TLS.
 # cert is required and token is still required
 
 # Client: pin server cert, then connect (client cert sent automatically)
@@ -266,7 +268,8 @@ Run the daemon in the foreground under your supervisor:
 ```bash
 pythond daemon
 # or
-pyctl start --listen 0.0.0.0:7984 --tls
+pyctl start --listen 0.0.0.0:7984
+# non-loopback --listen auto-enables TLS
 ```
 
 Operational signals:

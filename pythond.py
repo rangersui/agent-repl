@@ -259,6 +259,20 @@ else:
     except ImportError:
         pass  # optional module -- feature disabled without it
 
+def _safe_posix_runtime_base(path: str) -> bool:
+    """Return True only for owner-private, non-symlink POSIX runtime dirs."""
+    if sys.platform == "win32" or not hasattr(os, "getuid"):
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(st.st_mode) and
+        st.st_uid == os.getuid() and
+        stat.S_IMODE(st.st_mode) == 0o700
+    )
+
 def _default_sock() -> str:
     """Default AF_UNIX socket path.
 
@@ -512,20 +526,6 @@ def _secure_path_win32(path: str) -> None:
         print(f"WARN: cannot set DACL on {path}: {e.__class__.__name__}",
               file=sys.stderr)
         raise RuntimeError(f"cannot secure directory: {path}") from e
-
-def _safe_posix_runtime_base(path: str) -> bool:
-    """Return True only for owner-private, non-symlink POSIX runtime dirs."""
-    if sys.platform == "win32" or not hasattr(os, "getuid"):
-        return False
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return False
-    return (
-        stat.S_ISDIR(st.st_mode) and
-        st.st_uid == os.getuid() and
-        stat.S_IMODE(st.st_mode) == 0o700
-    )
 
 def _runtime_dir() -> str:
     """Return the private runtime directory for daemon metadata."""

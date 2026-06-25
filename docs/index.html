@@ -27,28 +27,24 @@ Same namespace.</p>
 
 <pre>pip install pythond</pre>
 
-<p>Python 3.10+. Three commands:</p>
+<p>Python 3.10+. Three entry points:</p>
 
 <table>
 <tr><th>Command</th><th>Role</th><th>Like</th></tr>
 <tr><td><code>pythond</code></td><td>daemon</td><td>sshd</td></tr>
-<tr><td><code>pysh</code></td><td>session client</td><td>ssh</td></tr>
+<tr><td><code>pysh</code></td><td>session client</td><td>function call / attach</td></tr>
 <tr><td><code>pyctl</code></td><td>daemon control</td><td>systemctl</td></tr>
 </table>
 
 <h2>Quick start</h2>
 
 <pre>
-# terminal 1
-pythond daemon
-
-# terminal 2
+pyctl start
 pysh new work
 pysh run work "x = 42"
 pysh run work "x + 1"
 # 43
-
-pysh attach work          # human REPL, Ctrl-] to detach
+pysh attach work
 </pre>
 
 <h2>State persists</h2>
@@ -140,12 +136,27 @@ pysh run work "exec(open('/tmp/task.py').read())"
 
 <pre>
 Agent channel (pysh run):       Human channel (pysh attach):
-  code in, text out               real PTY, readline, colors
+  code in, text out               POSIX PTY / Windows WinPTY
   no ANSI, no parsing             tab completion, Ctrl-C
   WebSocket protocol              Ctrl-] to detach
            \                     /
             same Python namespace
 </pre>
+
+<h2>Two control surfaces</h2>
+
+<pre>
+pysh run work "x = 1"     # agent/script: one-shot command
+pysh attach work        # human developer: interactive attach
+pyctl status            # operator: daemon status
+</pre>
+
+<p><code>pyctl</code> manages the daemon. <code>pysh</code> manages sessions.
+No command secretly starts the daemon, creates a session, and attaches in one
+step. <code>pysh attach</code> is a real PTY on POSIX/WSL. On native Windows it
+uses WinPTY, which preserves execution and shared state but is not fully
+byte-transparent for readline screen redraws. Use WSL when exact terminal
+behaviour matters.</p>
 
 <h2>Commands</h2>
 
@@ -155,13 +166,13 @@ pysh run &lt;name&gt; "code"       sync exec, raw output
 pysh fire &lt;name&gt; "code"      async thread, shares namespace (can't kill C code)
 pysh fork &lt;name&gt; "code"      async process (POSIX), killable, pickles vars back
 pysh poll &lt;name&gt; [cell_id]   check async result
-pysh attach &lt;name&gt;           human REPL
 pysh int &lt;name&gt;              interrupt (fire=best effort, fork=kill)
 pysh kill &lt;name&gt;             terminate session
 pysh ls                      list sessions
 pysh status &lt;name&gt;           JSON health
 pysh vars &lt;name&gt;             JSON namespace names
 pysh complete &lt;name&gt; "text"  JSON completion candidates
+pysh attach &lt;name&gt;           human REPL (Ctrl-] to detach)
 
 pyctl start [--listen H:P] [--tls] [--show-token]  start daemon
 pyctl stop                           stop daemon
@@ -231,9 +242,9 @@ unless you are willing for them to persist in that session and its local files.<
 <h2>Platform</h2>
 
 <table>
-<tr><th>Platform</th><th>PTY</th><th>Transport</th></tr>
-<tr><td>Linux / macOS / WSL</td><td>pty.openpty()</td><td>AF_UNIX WebSocket</td></tr>
-<tr><td>Windows</td><td>pywinpty</td><td>TCP WebSocket</td></tr>
+<tr><th>Platform</th><th>PTY</th><th>Transport</th><th>Attach behaviour</th></tr>
+<tr><td>Linux / macOS / WSL</td><td>pty.openpty()</td><td>AF_UNIX WebSocket</td><td>raw byte-transparent PTY</td></tr>
+<tr><td>Windows</td><td>pywinpty</td><td>TCP WebSocket</td><td>console bridge; some readline redraws are degraded</td></tr>
 </table>
 
 <h2>Dependencies</h2>

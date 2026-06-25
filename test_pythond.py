@@ -852,7 +852,7 @@ def test_send_session_marks_large_response_unhealthy():
     try:
         resp = pythond.send_session(name, {"cmd": "status"}, timeout=1)
         check("large response returns error",
-              resp == {"error": "worker response too large; use pysh kill to restart"},
+              resp == {"error": f"worker response too large; use kill {name} to restart"},
               resp)
         check("large response marks unhealthy", session.get("_unhealthy") is True)
         resp2 = pythond.send_session(name, {"cmd": "status"}, timeout=1)
@@ -884,7 +884,7 @@ def test_send_session_marks_malformed_response_unhealthy():
     try:
         resp = pythond.send_session(name, {"cmd": "status"}, timeout=1)
         check("malformed response returns distinct error",
-              resp == {"error": "malformed worker response; use pysh kill to restart"},
+              resp == {"error": f"malformed worker response; use kill {name} to restart"},
               resp)
         check("malformed response marks unhealthy", session.get("_unhealthy") is True)
     finally:
@@ -1202,6 +1202,38 @@ def test_wire_message_builder():
           "run remote_work\nx + 1")
     check("status wire",
           pythond._build_wire_message("status", ["work"]) == "status work")
+
+
+def test_wire_message_parser_human_input():
+    section("wire message parser human input")
+    check("CRLF ls is one-line command",
+          pythond._parse_wire_message("ls\r\n") == ("ls", [], "", False))
+    check("CRLF new has no empty extra arg",
+          pythond._parse_wire_message("new work\r\n") ==
+          ("new", ["work"], "", False))
+    check("pysh prefix is accepted for human direct use",
+          pythond._parse_wire_message("pysh ls\r\n") == ("ls", [], "", False))
+    check("inline run survives CRLF",
+          pythond._parse_wire_message("run work 1 + 1\r\n") ==
+          ("run", ["work", "1", "+", "1"], "", False))
+    check("protocol body is preserved",
+          pythond._parse_wire_message("run work\nprint('hi')\n") ==
+          ("run", ["work", "print('hi')\n"], "print('hi')\n", True))
+    check("blank human frame is empty",
+          pythond._parse_wire_message("\r\n") == ("", [], "", False))
+
+
+def test_raw_websocket_human_commands():
+    section("raw websocket human commands")
+    check("empty command returns prompt",
+          pythond._WS_PROMPT == ">>>")
+    help_resp = pythond.handle_client("help", [])
+    check("help returns raw protocol help",
+          "raw WebSocket protocol" in help_resp and
+          "new <name>" in help_resp and
+          "run <name>" in help_resp)
+    check("help rejects args",
+          pythond.handle_client("help", ["extra"]) == "ERR usage: help")
 
 
 def test_send_remote_transparent_alias():
@@ -1606,7 +1638,7 @@ def test_connection_hardening_static():
     close_session_seg = src[src.index("def _close_session_resources("):src.index("def _monitor_session(")]
     fork_monitor_seg = src[src.index("def _fork_monitor("):src.index("elif cmd == \"int\":")]
     tls_server_seg = src[src.index("class _TlsTerminatedServer:"):src.index("# =============================================\n# SHARED WORKER LOGIC")]
-    dispatch_seg = src[src.index("def _dispatch("):src.index("# =============================================\n# POSIX: real PTY worker")]
+    dispatch_seg = src[src.index("def _dispatch("):src.index("# ==================================\n# Session worker: shared namespace")]
     monitor_seg = src[src.index("def _monitor_session("):src.index("def send_session(")]
     recv_line_seg = src[src.index("def _recv_session_line("):src.index("def send_session(")]
     kill_session_seg = src[src.index("def kill_session("):src.index("def _close_session_resources(")]
@@ -1633,7 +1665,7 @@ def test_connection_hardening_static():
     client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
-    pysh_seg = src[src.index("def pysh_main("):src.index("def pyctl_main(")]
+    pysh_seg = src[src.index("def pysh_main("):src.index("def _pyctl_env_status(")]
     worker_entry_seg = src[src.index("def _worker_entry("):src.index("def _add_session_subparsers(")]
     session_name_seg = src[src.index("_SESSION_NAME_RE ="):src.index("_BUFFER_CHUNK")]
     validate_name_seg = src[src.index("def _validate_session_name("):src.index("def _public_error(")]
@@ -1659,8 +1691,8 @@ def test_connection_hardening_static():
           "ERR attach failed" in attach_seg and "ws.close()" in attach_seg)
     check("attach reports failure", "-> bool" in attach_seg)
     check("attach stream helper returns status",
-          "return _attach_ws_win(ws, name)" in attach_seg and
-          "return _attach_ws_pty(ws, name)" in attach_seg and
+          "return _attach_ws_win(ws, name, pre_attach_frames)" in attach_seg and
+          "return _attach_ws_pty(ws, name, pre_attach_frames)" in attach_seg and
           ") -> bool:" in attach_loop_seg and
           "ERR attach stream" in attach_loop_seg)
     check("attach terminal setup failure detaches",
@@ -1681,6 +1713,13 @@ def test_connection_hardening_static():
     check("attach rejects binary handshake response",
           "isinstance(resp, bytes)" in attach_seg and
           "ERR invalid attach response" in attach_seg)
+    check("attach clears visible screen without clearing scrollback",
+          "def _clear_attach_screen(" in src and
+          "\\033[2J\\033[H" in src and
+          "\\033[3J" not in src and
+          "if sys.platform != \"win32\":" in attach_seg and
+          "_clear_attach_screen()" in attach_seg and
+          "ws.send(b\"\\n\")" not in attach_loop_seg)
     check("attach POSIX requires TTY",
           "sys.stdin.isatty()" in attach_pty_seg and
           "attach requires a TTY" in attach_pty_seg)
@@ -1702,6 +1741,10 @@ def test_connection_hardening_static():
           "except Exception:\n        return None" not in send_seg)
     check("send labels post-connect failures as command failures",
           "ERR command failed: {_public_error(e)}" in send_seg)
+    check("stop delays shutdown until response can flush",
+          "def _delayed_shutdown(server: _Servable) -> None:" in src and
+          "time.sleep(0.2)" in src and
+          "threading.Thread(target=_delayed_shutdown" in src)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
     check("wsproto is used for WSS framing",
@@ -1862,9 +1905,13 @@ def test_connection_hardening_static():
           "proc.terminate(force=True)" in new_session_seg)
     check("worker entry has environment capability",
           "_WORKER_ENV" in main_seg and
-          "env={**os.environ, _WORKER_ENV: \"1\"}" in new_session_seg)
+          "worker_env = {**os.environ, _WORKER_ENV: \"1\"}" in new_session_seg and
+          "env=worker_env" in new_session_seg)
     check("winpty spawn env mutation is locked",
           "with _WORKER_SPAWN_LOCK:" in new_session_seg)
+    check("winpty keeps blocking reader protocol opaque",
+          "PYWINPTY_BLOCK" not in new_session_seg and
+          "0011Ignore" not in new_session_seg)
     check("winpty listener closes in finally",
           "finally:\n            ai_srv.close()" in new_session_seg)
     check("posix spawn failure closes fds and sockets",
@@ -2001,14 +2048,14 @@ def test_connection_hardening_static():
           "def _close_session_resources_once(" in close_session_seg)
     check("send_session separates malformed JSON",
           "except json.JSONDecodeError:" in send_session_seg and
-          "malformed worker response; use pysh kill to restart" in send_session_seg)
+          "malformed worker response; use kill {name} to restart" in send_session_seg)
     check("send_session marks OSError unhealthy",
           "except OSError:\n                s[\"_unhealthy\"] = True" in send_session_seg)
     check("send_session marks oversized worker response unhealthy",
           "except ValueError:" in send_session_seg and
-          "worker response too large; use pysh kill to restart" in send_session_seg)
+          "worker response too large; use kill {name} to restart" in send_session_seg)
     check("timed out command channel stays unhealthy",
-          "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
+          "msg.get(\"cmd\") != \"int\"" not in src and "use kill {name}" in src)
     check("remote does not retry after send",
           "remote response failed" in remote_seg and
           "remote send failed" in remote_seg and
@@ -2060,6 +2107,10 @@ def test_connection_hardening_static():
           "def _add_session_subparsers(" in src and
           "_add_session_subparsers(sub)" in main_seg and
           "_add_session_subparsers(sub)" in pysh_seg)
+    check("pysh owns attach directly",
+          ("_interactive_" "client(") not in src and
+          ("def py" "mux_main(") not in src and
+          "attach(args.name)" in pysh_seg)
     check("pysh run accepts remote proxy target session",
           "p_cmd.add_argument(\"code\", nargs=argparse.REMAINDER)" in add_session_subparsers_seg)
     check("manual help strings removed",
@@ -2071,6 +2122,9 @@ def test_connection_hardening_static():
     check("attach reader uses bounded recv",
           "ws.recv(timeout=2)" in attach_reader_seg and
           "except (TimeoutError, socket.timeout):" in attach_reader_seg)
+    check("attach reader uses injected output writer",
+          "write_output: typing.Callable[[bytes], None]" in attach_reader_seg and
+          "write_output(frame)" in attach_reader_seg)
     check("attach reader surfaces text errors",
           "print(frame, file=sys.stderr)" in attach_reader_seg)
     check("attach reader exact detached sentinel",
@@ -2085,24 +2139,62 @@ def test_connection_hardening_static():
           "t.join(timeout=3)" in attach_loop_seg and
           attach_loop_seg.index("t.join(timeout=3)") <
           attach_loop_seg.index("restore_terminal()"))
+    check("attach loop prints pysh banner without injecting input",
+          "pysh: attached to" in attach_loop_seg and
+          "ws.send(b\"\\n\")" not in attach_loop_seg)
     check("windows attach clears processed input",
           "old_in.value & ~0x0007" in attach_win_seg and
-          "_WIN_ENABLE_PROCESSED_INPUT" not in attach_win_seg)
+          "_WIN_ENABLE_PROCESSED_INPUT" not in attach_win_seg and
+          "~_WIN_ENABLE_VIRTUAL_TERMINAL_INPUT" in attach_win_seg)
     check("windows attach requires TTY",
           "sys.stdin.isatty()" in attach_win_seg and
           "attach requires a TTY" in attach_win_seg)
-    check("windows attach consumes extended key bytes together",
+    check("windows attach translates extended keys to VT sequences",
           "first in (\"\\x00\", \"\\xe0\")" in attach_win_seg and
-          "return bytes((ord(first) & 0xFF, ord(second) & 0xFF))" in attach_win_seg and
+          "_WIN_EXTENDED_KEY_TO_VT.get(second)" in attach_win_seg and
+          "return bytes((ord(first) & 0xFF, ord(second) & 0xFF))" not in attach_win_seg and
           "while not stopped.is_set() and not msvcrt.kbhit():" in attach_win_seg)
     check("windows attach reads full unicode chars",
           "msvcrt.getwch()" in attach_win_seg and
           "first.encode(\"utf-8\")" in attach_win_seg)
+    check("windows attach filters terminal CSI responses",
+          "if first == \"\\x1b\":" in attach_win_seg and
+          "re.fullmatch" in attach_win_seg and
+          r'"\x1b\[(?:\?|>)?[0-9;]*[cR]"' in attach_win_seg and
+          "return None" in attach_win_seg)
     check("windows attach checks console mode calls",
           "if not kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in)):" in attach_win_seg and
           "if not kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out)):" in attach_win_seg)
+    check("windows attach does not reset viewport",
+          "_clear_attach_screen()" not in attach_win_seg)
+    check("windows attach writes through text stream",
+          "def write_output(data: bytes) -> None:" in attach_win_seg and
+          "sys.stdout.write(data.decode(\"utf-8\", \"replace\"))" in attach_win_seg and
+          "sys.stdout.flush()" in attach_win_seg and
+          "os.write(sys.stdout.fileno()" not in attach_win_seg)
     check("windows attach clears line and echo input",
           "& ~0x0007" in attach_win_seg)
+    check("session banner includes Python version",
+          "Python {sys.version.split()[0]}" in session_worker_seg and
+          "shared with AI." in session_worker_seg and
+          "Ctrl-] detaches. exit() kills session." in session_worker_seg)
+    check("human raw_input restores real terminal streams",
+          "def raw_input(self, prompt: str = \"\") -> str:" in session_worker_seg and
+          "if isinstance(old_out, _ThreadStdout):" in session_worker_seg and
+          "sys.stdout = old_out._real" in session_worker_seg and
+          "return input(prompt)" in session_worker_seg and
+          "finally:\n                sys.stdout = old_out" in session_worker_seg)
+    check("worker subprocesses get default TERM",
+          "os.environ.setdefault(\"TERM\", \"xterm-256color\")" in new_session_seg and
+          "worker_env.setdefault(\"TERM\", \"xterm-256color\")" in new_session_seg and
+          "env=worker_env" in new_session_seg)
+    check("new session waits for initial prompt",
+          "bridge.wait_for_history(b\">>> \", _SESSION_READY_TIMEOUT)" in new_session_seg)
+    check("AI broadcast avoids fake REPL prompt",
+          "[ai] run: " in session_worker_seg and
+          "[ai] >>> " not in session_worker_seg and
+          "getattr(sys, \"ps1\"" not in session_worker_seg and
+          "sys.stdout.write(prompt)" not in session_worker_seg)
     check("client prints ERR to stderr",
           "if resp and resp.startswith(\"ERR \") and fail_on_err:" in client_seg and
           "resp.startswith(\"ERR \")" in client_seg and
@@ -2141,11 +2233,9 @@ def test_connection_hardening_static():
           daemon_full_seg.index("return\n                _access_log(\"auth\"") <
           daemon_full_seg.index("finally:\n            _access_log(\"disconnect\""))
     check("daemon command access log omits body content",
+          "_parse_wire_message(raw)" in daemon_full_seg and
           "body_len = len(body.encode" in daemon_full_seg and
           "session_name = args[0] if args else \"\"" in daemon_full_seg and
-          "args.append(body)" in daemon_full_seg and
-          daemon_full_seg.index("session_name = args[0] if args else \"\"") <
-          daemon_full_seg.index("args.append(body)") and
           "body_bytes=body_len" in daemon_full_seg and
           "detail=body" not in daemon_full_seg)
 
@@ -2178,6 +2268,32 @@ def test_session_cli_errors_exit_nonzero():
                 check(f"{entry_name} exits nonzero on ERR", e.code == 1, e.code)
             check(f"{entry_name} prints ERR to stderr",
                   response in err.getvalue(), err.getvalue())
+
+
+def test_pysh_attach_calls_attach():
+    section("pysh attach calls attach")
+    with mock.patch.object(sys, "argv", ["pysh", "attach", "work"]), \
+         mock.patch.object(pythond, "attach", return_value=True) as attach_fn:
+        pythond.pysh_main()
+    check("pysh attach delegates to attach", attach_fn.call_args.args == ("work",))
+
+
+def test_windows_extended_key_mapping():
+    section("windows extended key mapping")
+    table = pythond._WIN_EXTENDED_KEY_TO_VT
+    check("arrow keys translate to ANSI",
+          table["H"] == b"\x1b[A" and
+          table["P"] == b"\x1b[B" and
+          table["K"] == b"\x1b[D" and
+          table["M"] == b"\x1b[C",
+          table)
+    check("navigation keys translate to ANSI",
+          table["G"] == b"\x1b[H" and
+          table["O"] == b"\x1b[F" and
+          table["S"] == b"\x1b[3~",
+          table)
+    check("unknown extended keys are dropped",
+          table.get("?") is None)
 
 
 def test_attach_loop_reports_stream_failure():
@@ -2241,6 +2357,41 @@ def test_attach_loop_reports_clean_detach():
     check("local detach returns success", ok is True)
     check("local detach restores terminal", restored == [True])
     check("local detach closes websocket", ws.closed is True)
+
+
+def test_attach_tolerates_binary_preface_before_ok():
+    section("attach tolerates binary preface before OK")
+
+    class PrefaceWs:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+            self.frames = [b"Python banner\r\n>>> ", "OK attached"]
+        def send(self, data):
+            self.sent.append(data)
+        def recv(self, timeout=0):
+            return self.frames.pop(0)
+        def close(self):
+            self.closed = True
+
+    captured = []
+    ws = PrefaceWs()
+
+    def fake_attach(ws_arg, name, initial_frames=None):
+        captured.append((ws_arg, name, initial_frames))
+        return True
+
+    with mock.patch.object(pythond, "_connect_daemon", return_value=ws), \
+         mock.patch.object(pythond.sys, "platform", "win32"), \
+         mock.patch.object(pythond, "_attach_ws_win", side_effect=fake_attach), \
+         mock.patch.object(sys, "stderr", io.StringIO()):
+        ok = pythond.attach("work")
+
+    check("binary preface attach succeeds", ok is True)
+    check("attach command sent", ws.sent == ["attach work"], ws.sent)
+    check("preface passed to attach loop",
+          captured == [(ws, "work", [b"Python banner\r\n>>> "])], captured)
+    check("successful attach leaves websocket open", ws.closed is False)
 
 
 def test_access_log_sanitises_session_field():
@@ -2827,14 +2978,7 @@ def test_integration_tls_pinned_server():
                     resp = pythond._send("ls", [])
                     check("tls ls works", "(no sessions)" in resp, resp)
                     resp = pythond._send("stop", [])
-                    check("tls stop sent",
-                          resp is None or
-                          "OK stopping daemon" in resp or
-                          "ERR command failed: ConnectionResetError" in resp or
-                          "ERR command failed: websocket closed" in resp or
-                          "ERR cannot connect: ConnectionResetError" in resp or
-                          "ERR cannot connect: websocket closed" in resp,
-                          resp)
+                    check("tls stop sent", resp == "OK stopping daemon", resp)
                 finally:
                     for key, value in [
                         ("PYTHOND_HOST", old_host),
@@ -3142,6 +3286,11 @@ def test_unit_pty_bridge():
     # write some data before attach -> should go to scrollback
     os.write(w_fd, b"scrollback data\n")
     time.sleep(0.2)
+    check("wait_for_history false before marker",
+          bridge.wait_for_history(b">>> ", 0.01) is False)
+    os.write(w_fd, b">>> ")
+    check("wait_for_history true after marker",
+          bridge.wait_for_history(b">>> ", 1.0) is True)
 
     # attach
     owner = bridge.attach(lambda data: received.append(data))
@@ -3164,7 +3313,7 @@ def test_unit_pty_bridge():
 
     def blocking_send(data):
         received.append(data)
-        if data == b"old scrollback\n":
+        if b"old scrollback\n" in data:
             os.write(w_fd, b"new live\n")
             time.sleep(0.2)
             release_scrollback.wait(timeout=3)
@@ -3180,13 +3329,16 @@ def test_unit_pty_bridge():
     )
     t.start()
     time.sleep(0.3)
-    check("live output waits for scrollback flush", received == [b"old scrollback\n"],
+    check("live output waits for scrollback flush",
+          len(received) == 1 and b"old scrollback\n" in received[0] and
+          b"new live\n" not in received[0],
           received)
     release_scrollback.set()
     flush_done.wait(timeout=3)
     time.sleep(0.3)
     check("scrollback delivered before live output",
-          received[:2] == [b"old scrollback\n", b"new live\n"], received)
+          b"".join(received).index(b"old scrollback\n") <
+          b"".join(received).index(b"new live\n"), received)
 
     # new data after attach -> goes to client directly
     received.clear()
@@ -3216,7 +3368,10 @@ def test_unit_pty_bridge():
     check("re-attach scrollback not flushed before ack", received == [])
     check("re-attach scrollback flush accepted",
           owner is not None and bridge.flush_scrollback(owner))
-    check("re-attach scrollback", b"after detach" in b"".join(received))
+    reattached = b"".join(received)
+    check("re-attach preserves prior live history", b"live data\n" in reattached,
+          reattached)
+    check("re-attach scrollback", b"after detach" in reattached, reattached)
 
     bridge.detach(owner)
     closed = []
@@ -3392,6 +3547,8 @@ def main():
         test_trust_cert_exact_fingerprint_store,
         test_websocket_protocol,
         test_wire_message_builder,
+        test_wire_message_parser_human_input,
+        test_raw_websocket_human_commands,
         test_send_remote_transparent_alias,
         test_send_remote_close_retries_and_closes,
         test_connect_remote_bytes_auth_failure,
@@ -3408,8 +3565,11 @@ def main():
         test_connection_hardening_static,
         test_entry_points_exist,
         test_session_cli_errors_exit_nonzero,
+        test_pysh_attach_calls_attach,
+        test_windows_extended_key_mapping,
         test_attach_loop_reports_stream_failure,
         test_attach_loop_reports_clean_detach,
+        test_attach_tolerates_binary_preface_before_ok,
         test_access_log_sanitises_session_field,
         test_pyctl_cert_role_hints,
         test_pyctl_status_uses_env_endpoint,

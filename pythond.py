@@ -10,16 +10,16 @@ Code in, result out. No terminal. No ANSI. No parsing.
 Variables, connections, threads survive between calls.  Connection != state.
 Disconnect and reconnect -- namespace still alive.
 
-AI agents use pysh as their Python runtime: one-shot bash_tool calls feed
-code into a persistent namespace.  Humans use pysh attach for an interactive
-REPL into the same namespace.  Both see the same objects.
+AI agents use pysh as their Python runtime: one-shot tool calls feed code into
+a persistent namespace.  Humans use pysh attach for interactive access to the
+same namespace.  Both see the same objects.
 
 The two-daemon proxy (pyctl connect) lets the local daemon reverse-proxy
 to a remote pythond -- the agent sends code locally, it executes remotely.
 
 Three entry points (pip install pythond):
   pythond    daemon lifecycle and all commands
-  pysh       send code to sessions (local or remote, transparent)
+  pysh       session client: one-shot commands and interactive attach
   pyctl      manage the daemon (start, stop, proxy, certs)
 
 Session commands (pysh):
@@ -28,7 +28,6 @@ Session commands (pysh):
     pysh fire <name> "code"      async thread -- shares namespace, can't kill C
     pysh fork <name> "code"      async process (POSIX only) -- killable, pickles vars back
     pysh poll <name> [cell_id]   check async result
-    pysh attach <name>           human REPL (Ctrl-] to detach)
     pysh int <name>              best-effort interrupt:
                                  fork cells are killed;
                                  fire cells get KeyboardInterrupt (Python only).
@@ -38,6 +37,7 @@ Session commands (pysh):
     pysh status <name>           session health (JSON)
     pysh vars <name>             namespace names (JSON)
     pysh complete <name> "text"  tab completion (JSON)
+    pysh attach <name>           human REPL (Ctrl-] to detach)
 
 Daemon commands (pyctl / pythond):
     pythond daemon [--listen HOST:PORT] [--tls] [--show-token]
@@ -202,6 +202,30 @@ def _protocol_version(version: str) -> str:
 # Version compatibility, not auth. Auth is token/TLS policy or AF_UNIX fs perms.
 _WS_PROTO: typing.Any = f"pythond.{_protocol_version(__version__)}"
 _WS_HELLO = "tis but a scratch"
+_WS_PROMPT = ">>>"
+_WS_HELP = f"""pythond {__version__} raw WebSocket protocol
+
+Commands:
+  help
+  ls
+  new <name>
+  run <name> <code>
+  run <name>
+<multi-line code body>
+  fire <name> <code>
+  fork <name> <code>
+  poll <name> [cell_id]
+  status <name>
+  vars <name>
+  complete <name> <text>
+  int <name>
+  kill <name>
+  attach <name> [rows cols]
+
+Notes:
+  pysh/pyctl prefixes are accepted but not required.
+  Empty input returns {_WS_PROMPT}.
+"""
 _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
 _MAX_WORKER_RESPONSE = int(os.environ.get("PYTHOND_MAX_WORKER_RESPONSE", str(16 * 1024 * 1024)))
@@ -226,10 +250,23 @@ _BUFFER_CHUNK = 64 * 1024
 _WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _ASYNC_CELL_TTL = 300
 _ATTACH_READ_SIZE = 1024
+_SESSION_READY_TIMEOUT = 2.0
 _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 _WIN_ENABLE_PROCESSED_OUTPUT = 0x0001
 _WIN_ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
 _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_WIN_EXTENDED_KEY_TO_VT: dict[str, bytes] = {
+    "H": b"\x1b[A",   # Up
+    "P": b"\x1b[B",   # Down
+    "M": b"\x1b[C",   # Right
+    "K": b"\x1b[D",   # Left
+    "G": b"\x1b[H",   # Home
+    "O": b"\x1b[F",   # End
+    "R": b"\x1b[2~",  # Insert
+    "S": b"\x1b[3~",  # Delete
+    "I": b"\x1b[5~",  # Page up
+    "Q": b"\x1b[6~",  # Page down
+}
 _WS_CLOSE = object()
 _ACCESS_STDERR_QUEUE: queue.Queue[str] = queue.Queue(maxsize=1024)
 _ACCESS_STDERR_STARTED = False
@@ -1790,17 +1827,21 @@ def _dispatch(
         return {"matches": matches}
     return {"error": f"unknown cmd: {cmd}"}
 
-# =============================================
-# POSIX: real PTY worker (readline, tab, arrows)
-# =============================================
+# ==================================
+# Session worker: shared namespace
+# ==================================
 
 def session_worker_pty(ai_sock: socket.socket) -> None:
-    """Runs in subprocess with PTY slave as stdin/stdout/stderr.
+    """Runs in a session subprocess with interactive stdio.
 
-    Human attach goes through the PTY and therefore gets real readline, tab
-    completion, terminal signals, and normal Python REPL behaviour.  AI commands
-    use ai_sock, a private socketpair using one JSON object per line.  Both
-    paths share the same namespace and lock.
+    POSIX sessions run behind a real PTY slave, so human attach receives raw
+    terminal bytes for readline redraws, tab completion, arrows, and signals.
+    Windows sessions run behind pywinpty, which is a console adapter rather than
+    a byte-transparent PTY; execution and shared state work, but some screen
+    redraws from interactive line editing may not replay exactly on attach.
+
+    AI commands use ai_sock, a private socketpair using one JSON object per
+    line.  Both paths share the same namespace and lock.
     """
     ns = _init_namespace()
     cells: dict[str, JsonDict] = {}
@@ -1819,7 +1860,7 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
         lines = src.strip().splitlines()
         sys.stdout.write("\n")
         for i, ln in enumerate(lines):
-            sys.stdout.write(f"{'[ai] >>> ' if i == 0 else '[ai] ... '}{ln}\n")
+            sys.stdout.write(f"{'[ai] run: ' if i == 0 else '[ai]   : '}{ln}\n")
         if output:
             sys.stdout.write(output + "\n")
         sys.stdout.flush()
@@ -1876,6 +1917,25 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
 
     class LockedConsole(code.InteractiveConsole):
         """InteractiveConsole that holds the session lock during eval."""
+        def raw_input(self, prompt: str = "") -> str:
+            """Read from the real terminal stream so readline stays enabled.
+
+            _ThreadStdout is required for AI-cell output capture, but GNU
+            readline expects the original terminal TextIOWrapper.  Restore the
+            real streams only while waiting for human input; code execution
+            still goes through runsource() and the shared lock below.
+            """
+            old_out, old_err = sys.stdout, sys.stderr
+            try:
+                if isinstance(old_out, _ThreadStdout):
+                    sys.stdout = old_out._real
+                if isinstance(old_err, _ThreadStdout):
+                    sys.stderr = old_err._real
+                return input(prompt)
+            finally:
+                sys.stdout = old_out
+                sys.stderr = old_err
+
         def runsource(
             self,
             source: str,
@@ -1893,7 +1953,8 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
         while True:
             try:
                 LockedConsole(locals=ns).interact(
-                    banner="shared with AI. Ctrl-] detaches. exit() kills session.",
+                    banner=(f"Python {sys.version.split()[0]} | shared with AI. "
+                            "Ctrl-] detaches. exit() kills session."),
                     exitmsg="")
             except SystemExit:
                 break
@@ -1994,9 +2055,22 @@ class PtyBridge:
         self._close_fn: typing.Callable[[], typing.Any] | None = None
         self._owner: object | None = None
         self._lock = threading.Lock()
+        self._history_cond = threading.Condition(self._lock)
+        self._history = bytearray()
         self._scrollback = bytearray()
         self._MAX = _BUFFER_CHUNK
         threading.Thread(target=self._reader, daemon=True).start()
+
+    def wait_for_history(self, marker: bytes, timeout: float) -> bool:
+        """Wait until marker appears in bounded PTY history."""
+        deadline = time.monotonic() + timeout
+        with self._history_cond:
+            while marker not in self._history:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._history_cond.wait(remaining)
+            return True
 
     def attach(
         self,
@@ -2022,27 +2096,34 @@ class PtyBridge:
             send_fn = self._pending_send_fn
             self._pending_send_fn = None
 
+        with self._lock:
+            if self._owner is not owner:
+                return False
+            scrollback = bytes(self._history)
+            self._scrollback.clear()
+
         while True:
-            scrollback = b""
             with self._lock:
                 if self._owner is not owner:
                     return False
-                if self._scrollback:
-                    scrollback = bytes(self._scrollback)
-                    self._scrollback.clear()
-                else:
+            if scrollback:
+                try:
+                    send_fn(scrollback)
+                except Exception:
+                    close_fn = None
+                    with self._lock:
+                        if self._owner is owner:
+                            close_fn = self._take_close_fn_locked(owner)
+                    self._call_close_fn(close_fn)
+                    return False
+            with self._lock:
+                if self._owner is not owner:
+                    return False
+                if not self._scrollback:
                     self._send_fn = send_fn
                     return True
-            try:
-                send_fn(scrollback)
-            except Exception:
-                close_fn = None
-                with self._lock:
-                    if self._owner is owner:
-                        self._buffer_scrollback_front_locked(scrollback)
-                        close_fn = self._take_close_fn_locked(owner)
-                self._call_close_fn(close_fn)
-                return False
+                scrollback = bytes(self._scrollback)
+                self._scrollback.clear()
 
     def _take_close_fn_locked(
         self,
@@ -2080,11 +2161,12 @@ class PtyBridge:
         if len(self._scrollback) > self._MAX:
             del self._scrollback[:-self._MAX]
 
-    def _buffer_scrollback_front_locked(self, data: bytes) -> None:
-        """Prepend failed attach scrollback. Caller holds _lock."""
-        self._scrollback[:0] = data[-self._MAX:]
-        if len(self._scrollback) > self._MAX:
-            del self._scrollback[:-self._MAX]
+    def _buffer_history_locked(self, data: bytes) -> None:
+        """Append to bounded PTY history. Caller holds _lock."""
+        self._history.extend(data)
+        if len(self._history) > self._MAX:
+            del self._history[:-self._MAX]
+        self._history_cond.notify_all()
 
     def detach(self, owner: object | None = None) -> None:
         """Detach current client. PTY output goes to scrollback buffer."""
@@ -2095,6 +2177,7 @@ class PtyBridge:
         """Drop any attached client and buffered PTY output during session kill."""
         with self._lock:
             close_fn = self._take_close_fn_locked()
+            self._history.clear()
             self._scrollback.clear()
         self._call_close_fn(close_fn)
 
@@ -2113,6 +2196,7 @@ class PtyBridge:
                 break
             send_fn = None
             with self._lock:
+                self._buffer_history_locked(data)
                 if self._send_fn:
                     send_fn = self._send_fn
                 else:
@@ -2135,6 +2219,9 @@ def new_session(name: str) -> JsonDict:
     if _get_session(name) is not None:
         kill_session(name)
     if _HAS_PTY and _WinPty is not None:
+        # Windows: pywinpty gives us a usable console-backed Python REPL, not a
+        # POSIX-style raw byte stream.  Keep attach functional, but do not rely
+        # on it for exact readline screen-redraw semantics.
         ai_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         proc = None
         ai_conn: socket.socket | None = None
@@ -2147,7 +2234,9 @@ def new_session(name: str) -> JsonDict:
             ai_srv.settimeout(10)
             with _WORKER_SPAWN_LOCK:
                 old_worker_env = os.environ.get(_WORKER_ENV)
+                old_term = os.environ.get("TERM")
                 os.environ[_WORKER_ENV] = "1"
+                os.environ.setdefault("TERM", "xterm-256color")
                 try:
                     proc = _WinPty.spawn(
                         [sys.executable, os.path.abspath(__file__),
@@ -2158,6 +2247,10 @@ def new_session(name: str) -> JsonDict:
                         os.environ.pop(_WORKER_ENV, None)
                     else:
                         os.environ[_WORKER_ENV] = old_worker_env
+                    if old_term is None:
+                        os.environ.pop("TERM", None)
+                    else:
+                        os.environ["TERM"] = old_term
             ai_conn, _ = ai_srv.accept()
         except socket.timeout:
             if proc is not None:
@@ -2179,8 +2272,10 @@ def new_session(name: str) -> JsonDict:
                 return b""
         def _write(data: bytes) -> None:
             proc.write(data.decode(errors="replace"))
+        bridge: PtyBridge
         try:
             bridge = PtyBridge(_read, _write)
+            bridge.wait_for_history(b">>> ", _SESSION_READY_TIMEOUT)
         except Exception:
             ai_conn.close()
             with contextlib.suppress(Exception):
@@ -2204,12 +2299,14 @@ def new_session(name: str) -> JsonDict:
         try:
             master_fd, slave_fd = pty.openpty()  # type: ignore[name-defined]
             ai_parent, ai_child = socket.socketpair()
+            worker_env = {**os.environ, _WORKER_ENV: "1"}
+            worker_env.setdefault("TERM", "xterm-256color")
             p = subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__),
                  "_worker_pty", str(slave_fd), str(ai_child.fileno())],
                 close_fds=True,
                 pass_fds=(slave_fd, ai_child.fileno()),
-                env={**os.environ, _WORKER_ENV: "1"},
+                env=worker_env,
                 start_new_session=True,
             )
         except Exception:
@@ -2232,6 +2329,7 @@ def new_session(name: str) -> JsonDict:
             bridge = PtyBridge(
                 lambda: os.read(master_fd, 4096),
                 lambda d: _write_all(master_fd, d))
+            bridge.wait_for_history(b">>> ", _SESSION_READY_TIMEOUT)
         except Exception:
             with contextlib.suppress(OSError):
                 os.close(master_fd)
@@ -2456,31 +2554,31 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
             return {"error": f"session '{name}' not found"}
         if s.get("_unhealthy"):
             return {"error": f"session '{name}' command channel out of sync after timeout; "
-                    f"use pysh kill {name}"}
+                    f"use kill {name}"}
         if s["type"] == "remote":
             return _send_remote(s, msg, timeout)
         if s["type"] == "pty":
             ai = typing.cast(SocketLike | None, s.get("ai"))
             if ai is None:
-                return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
+                return {"error": f"session '{name}' dead -- new {name} to restart"}
             try:
                 ai.settimeout(timeout)
                 ai.sendall((json.dumps(msg) + "\n").encode("utf-8"))
                 line = _recv_session_line(s, ai)
                 if not line:
-                    return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
+                    return {"error": f"session '{name}' dead -- new {name} to restart"}
                 resp: dict[str, typing.Any] = json.loads(line)
                 return resp
             except socket.timeout:
                 s["_unhealthy"] = True
                 return {"error": "timeout -- command channel may be out of sync; "
-                        "use pysh int or pysh kill if stuck"}
+                        f"use int {name} or kill {name} if stuck"}
             except json.JSONDecodeError:
                 s["_unhealthy"] = True
-                return {"error": "malformed worker response; use pysh kill to restart"}
+                return {"error": f"malformed worker response; use kill {name} to restart"}
             except ValueError:
                 s["_unhealthy"] = True
-                return {"error": "worker response too large; use pysh kill to restart"}
+                return {"error": f"worker response too large; use kill {name} to restart"}
             except OSError:
                 s["_unhealthy"] = True
                 return {"error": "session command failed"}
@@ -2788,6 +2886,34 @@ def _build_wire_message(cmd: str, args: list[str]) -> str:
     return " ".join([cmd] + args)
 
 
+def _parse_wire_message(raw: str) -> tuple[str, list[str], str, bool]:
+    """Parse one WebSocket text frame into command, args, body, has_body.
+
+    Human tools such as websocat commonly send one-line frames ending in CRLF.
+    Treat a single trailing line ending as terminal input noise, not as an empty
+    protocol body.  Multi-line frames keep their body exactly after the first
+    newline.
+    """
+    raw = raw.replace("\r\n", "\n")
+    if raw.endswith("\n") and raw.count("\n") == 1:
+        raw = raw[:-1]
+    if "\n" in raw:
+        header, body = raw.split("\n", 1)
+        has_body = True
+    else:
+        header, body = raw, ""
+        has_body = False
+    header = header.rstrip("\r")
+    parts = header.split()
+    if parts and parts[0] in ("pysh", "pyctl"):
+        parts = parts[1:]
+    cmd = parts[0] if parts else ""
+    args = parts[1:]
+    if has_body:
+        args.append(body)
+    return cmd, args, body, has_body
+
+
 def _send_remote(
     session: JsonDict,
     msg: JsonDict,
@@ -2920,7 +3046,11 @@ def _handle_stop(args: list[str]) -> str:
     if args:
         return "ERR usage: pyctl stop"
     if _daemon_server is not None:
-        threading.Thread(target=_daemon_server.shutdown, daemon=True).start()
+        def _delayed_shutdown(server: _Servable) -> None:
+            time.sleep(0.2)
+            server.shutdown()
+        threading.Thread(target=_delayed_shutdown, args=(_daemon_server,),
+                         daemon=True).start()
     return "OK stopping daemon"
 
 
@@ -2952,14 +3082,14 @@ def _handle_disconnect(args: list[str]) -> str:
 
 def _handle_new(args: list[str]) -> str:
     if not args:
-        return "ERR usage: pysh new <name>"
+        return "ERR usage: new <name>"
     name = args[0]
     try:
         _validate_session_name(name)
     except ValueError:
         return "ERR invalid session name"
     if len(args) > 1:
-        return (f"ERR pysh new takes a name only"
+        return (f"ERR new takes a name only"
                 f" (got extra: {' '.join(args[1:])})."
                 f" sessions are always Python")
     try:
@@ -2977,7 +3107,7 @@ def _handle_new(args: list[str]) -> str:
 
 def _handle_int(args: list[str]) -> str:
     if len(args) != 1:
-        return "ERR usage: pysh int <name>"
+        return "ERR usage: int <name>"
     name = args[0]
     if _get_session(name) is None:
         return f"ERR no session '{name}'"
@@ -2986,7 +3116,7 @@ def _handle_int(args: list[str]) -> str:
         return f"ERR int failed for {name}"
     if "error" in resp:
         return (f"ERR int failed for {name}: {resp['error']}. "
-                "Session may be stuck in run or C code; use pysh kill.")
+                f"Session may be stuck in run or C code; use kill {name}.")
     t = resp.get("threads", 0)
     p = resp.get("processes", 0)
     parts: list[str] = []
@@ -3001,7 +3131,7 @@ def _handle_int(args: list[str]) -> str:
 
 def _handle_kill(args: list[str]) -> str:
     if len(args) != 1:
-        return "ERR usage: pysh kill <name>"
+        return "ERR usage: kill <name>"
     name = args[0]
     if kill_session(name):
         return f"OK killed {name}"
@@ -3046,7 +3176,7 @@ def _handle_resize(args: list[str]) -> str:
 
 def _handle_ls(args: list[str]) -> str:
     if args:
-        return "ERR usage: pysh ls"
+        return "ERR usage: ls"
     lines: list[str] = []
     for n, s in _session_snapshot():
         if s["type"] == "remote":
@@ -3098,7 +3228,7 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
     name = args[0]
     s = _get_session(name)
     if s is None:
-        return f"ERR no session '{name}' -- pysh new {name}"
+        return f"ERR no session '{name}' -- create it first with: new {name}"
     inner_args = args[1:]
     if cmd in ("run", "fire", "fork") and inner_args:
         if s["type"] == "remote":
@@ -3133,6 +3263,7 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
 
 
 _CONTROL_HANDLERS: dict[str, typing.Callable[[list[str]], str]] = {
+    "help": lambda args: "ERR usage: help" if args else _WS_HELP,
     "stop": _handle_stop,
     "connect": _handle_connect,
     "disconnect": _handle_disconnect,
@@ -3260,18 +3391,11 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                     ws.send("ERR binary frame not allowed in command mode")
                     continue
                 # protocol: "cmd arg1 arg2\nbody"
-                if "\n" in raw:
-                    header, body = raw.split("\n", 1)
-                    has_body = True
-                else:
-                    header, body = raw, ""
-                    has_body = False
-                parts = header.split()
-                cmd = parts[0] if parts else ""
-                args = parts[1:]
+                cmd, args, body, has_body = _parse_wire_message(raw)
+                if not cmd:
+                    ws.send(_WS_PROMPT)
+                    continue
                 session_name = args[0] if args else ""
-                if has_body:
-                    args.append(body)
                 body_len = len(body.encode("utf-8", "replace")) if has_body else 0
                 _access_log("command", conn_id=conn_id, peer=peer, cmd=cmd,
                             session=session_name, body_bytes=body_len)
@@ -3535,6 +3659,18 @@ def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
     if resp and resp.startswith("ERR ") and fail_on_err:
         sys.exit(1)
 
+
+def _clear_attach_screen() -> None:
+    """Clear the visible terminal before handing it to the attached PTY."""
+    if not sys.stdout.isatty():
+        return
+    try:
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
 def attach(name: str) -> bool:
     """Connect a human terminal to a session REPL via WebSocket binary frames.
     Ctrl-] detaches. Session stays alive."""
@@ -3553,7 +3689,26 @@ def attach(name: str) -> bool:
         pass  # non-interactive or detached terminal -- attach can still try
     try:
         ws.send(f"attach {name}{resize_args}")
-        resp = ws.recv(timeout=5)
+        pre_attach_frames: list[bytes] = []
+        pre_attach_size = 0
+        resp: str | object = ""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            frame = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+            if frame is _WS_CLOSE:
+                resp = "ERR daemon closed connection"
+                break
+            if isinstance(frame, bytes):
+                pre_attach_size += len(frame)
+                if pre_attach_size > _BUFFER_CHUNK:
+                    resp = "ERR attach preface too large"
+                    break
+                pre_attach_frames.append(frame)
+                continue
+            resp = frame
+            break
+        else:
+            resp = "ERR attach timeout"
     except Exception as e:
         try:
             ws.close()
@@ -3561,9 +3716,9 @@ def attach(name: str) -> bool:
             pass  # connection closing -- send/close may fail
         print(f"ERR attach failed: {_public_error(e)}", file=sys.stderr)
         return False
-    if resp is _WS_CLOSE:
-        resp = "ERR daemon closed connection"
     if isinstance(resp, bytes):
+        resp = "ERR invalid attach response"
+    if not isinstance(resp, str):
         resp = "ERR invalid attach response"
     if not resp.startswith("OK"):
         print(resp, file=sys.stderr)
@@ -3571,10 +3726,12 @@ def attach(name: str) -> bool:
         return False
 
     try:
+        if sys.platform != "win32":
+            _clear_attach_screen()
         if sys.platform == "win32":
-            return _attach_ws_win(ws, name)
+            return _attach_ws_win(ws, name, pre_attach_frames)
         else:
-            return _attach_ws_pty(ws, name)
+            return _attach_ws_pty(ws, name, pre_attach_frames)
     except Exception as e:
         try:
             ws.send("detach")
@@ -3591,6 +3748,7 @@ def _attach_reader(
     ws: WebSocketLike,
     stopped: threading.Event,
     clean: threading.Event,
+    write_output: typing.Callable[[bytes], None],
 ) -> None:
     """WebSocket output -> stdout for both POSIX and Windows attach."""
     try:
@@ -3602,7 +3760,7 @@ def _attach_reader(
             if frame is _WS_CLOSE:
                 break
             if isinstance(frame, bytes):
-                os.write(sys.stdout.fileno(), frame)
+                write_output(frame)
             elif isinstance(frame, str):
                 if frame == "OK detached":
                     clean.set()
@@ -3621,17 +3779,30 @@ def _attach_ws_loop(
     name: str,
     read_input: typing.Callable[[threading.Event], bytes | None],
     restore_terminal: typing.Callable[[], None],
+    initial_frames: list[bytes] | None = None,
+    write_output: typing.Callable[[bytes], None] | None = None,
 ) -> bool:
     """Shared attach loop. read_input returns bytes, None, or b'' for EOF."""
+    def _write_stdout_bytes(data: bytes) -> None:
+        os.write(sys.stdout.fileno(), data)
+
+    writer: typing.Callable[[bytes], None]
+    if write_output is None:
+        writer = _write_stdout_bytes
+    else:
+        writer = write_output
     if name:
-        print(f"attached to {name} (Ctrl-] to detach)", file=sys.stderr)
+        print(f"pysh: attached to \"{name}\" | Ctrl-] to detach", file=sys.stderr)
+    for frame in initial_frames or []:
+        writer(frame)
     stopped = threading.Event()
     clean = threading.Event()
     local_detach = False
     stream_failed = False
     t: threading.Thread | None = None
     try:
-        t = threading.Thread(target=_attach_reader, args=(ws, stopped, clean),
+        t = threading.Thread(target=_attach_reader,
+                             args=(ws, stopped, clean, writer),
                              daemon=True)
         t.start()
         while not stopped.is_set():
@@ -3676,7 +3847,11 @@ def _attach_ws_loop(
     return False
 
 
-def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> bool:
+def _attach_ws_pty(
+    ws: WebSocketLike,
+    name: str = "",
+    initial_frames: list[bytes] | None = None,
+) -> bool:
     """POSIX raw terminal attach via WebSocket."""
     if not sys.stdin.isatty():
         raise RuntimeError("attach requires a TTY")
@@ -3696,11 +3871,20 @@ def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> bool:
             old,
         )
 
-    return _attach_ws_loop(ws, name, read_input, restore_terminal)
+    return _attach_ws_loop(ws, name, read_input, restore_terminal, initial_frames)
 
 
-def _attach_ws_win(ws: WebSocketLike, name: str = "") -> bool:
-    """Windows raw terminal attach via WebSocket."""
+def _attach_ws_win(
+    ws: WebSocketLike,
+    name: str = "",
+    initial_frames: list[bytes] | None = None,
+) -> bool:
+    """Windows console attach via pywinpty/WebSocket.
+
+    This path translates local console input into PTY-style bytes where possible.
+    pywinpty is not a raw POSIX PTY, so readline history recall may execute even
+    when the intermediate line redraw is not fully visible to the client.
+    """
     if not sys.stdin.isatty():
         raise RuntimeError("attach requires a TTY")
     import ctypes, msvcrt
@@ -3722,7 +3906,7 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> bool:
         raise RuntimeError("GetConsoleMode failed")
     kernel32.SetConsoleMode(
         stdin_h,
-        (old_in.value & ~0x0007) | _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT,
+        old_in.value & ~0x0007 & ~_WIN_ENABLE_VIRTUAL_TERMINAL_INPUT,
     )
     kernel32.SetConsoleMode(
         stdout_h,
@@ -3736,20 +3920,38 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> bool:
             time.sleep(0.01)
             return None
         first = msvcrt.getwch()
+        if first == "\x1b":
+            seq = first
+            deadline = time.monotonic() + 0.05
+            while len(seq) < 64 and time.monotonic() < deadline:
+                if not msvcrt.kbhit():
+                    time.sleep(0.001)
+                    continue
+                seq += msvcrt.getwch()
+                if len(seq) >= 3 and seq[1] == "[" and seq[-1].isalpha():
+                    break
+            if re.fullmatch(r"\x1b\[(?:\?|>)?[0-9;]*[cR]", seq):
+                return None
+            return seq.encode("utf-8")
         if first in ("\x00", "\xe0"):
             while not stopped.is_set() and not msvcrt.kbhit():
                 time.sleep(0.01)
             if stopped.is_set():
                 return None
             second = msvcrt.getwch()
-            return bytes((ord(first) & 0xFF, ord(second) & 0xFF))
+            return _WIN_EXTENDED_KEY_TO_VT.get(second)
         return first.encode("utf-8")
 
     def restore_terminal() -> None:
         kernel32.SetConsoleMode(stdin_h, old_in.value)
         kernel32.SetConsoleMode(stdout_h, old_out.value)
 
-    return _attach_ws_loop(ws, name, read_input, restore_terminal)
+    def write_output(data: bytes) -> None:
+        sys.stdout.write(data.decode("utf-8", "replace"))
+        sys.stdout.flush()
+
+    return _attach_ws_loop(
+        ws, name, read_input, restore_terminal, initial_frames, write_output)
 
 def _worker_entry(argv: list[str]) -> bool:
     """Handle internal worker subprocess entry points."""
@@ -3827,7 +4029,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="pythond",
         description="Persistent Python REPL daemon.",
-        epilog=f"Use pysh for session commands and pyctl for daemon management. {_SESSION_NAME_RULE}",
+        epilog=f"Use pysh for sessions and pyctl for daemon management. {_SESSION_NAME_RULE}",
     )
     parser.add_argument("-V", "--version", action="version",
                         version=f"pythond {__version__}")
@@ -3865,7 +4067,7 @@ def pysh_main() -> None:
     argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
         prog="pysh",
-        description="Python Shell: client for pythond daemon.",
+        description="Client for pythond sessions.",
         epilog=f"{_SESSION_NAME_RULE} Remote sessions are managed by pyctl connect/disconnect.",
     )
     parser.add_argument("-V", "--version", action="version",
@@ -3885,8 +4087,8 @@ def pysh_main() -> None:
     if args.command == "attach":
         if not attach(args.name):
             sys.exit(1)
-    else:
-        client(args.command, argv[1:], fail_on_err=True)
+        return
+    client(args.command, argv[1:], fail_on_err=True)
 
 
 def _pyctl_env_status() -> bool:
@@ -3926,7 +4128,7 @@ def pyctl_main() -> None:
     parser = argparse.ArgumentParser(
         prog="pyctl",
         description="pythond daemon control.",
-        epilog="pysh sends code; pyctl manages daemon lifecycle, proxy, and certs.",
+        epilog="pysh manages sessions; pyctl manages lifecycle, proxy, and certs.",
     )
     parser.add_argument("-V", "--version", action="version",
                         version=f"pythond {__version__}")

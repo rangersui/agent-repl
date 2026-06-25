@@ -12,22 +12,22 @@ pip install pythond
 ## Quick start
 
 ```bash
-# Terminal 1: start daemon
-pythond daemon
+# Daemon lifecycle is explicit.
+pyctl start
 
-# Terminal 2: use it
+# Session operations are explicit.
 pysh new work
 pysh run work "x = 42"
 pysh run work "x + 1"          # → 43 (state persists)
-pysh attach work               # → real Python REPL (Ctrl-] to detach)
+pysh attach work               # human REPL; Ctrl-] detaches
 ```
 
-## Three commands
+## Entry points
 
 | Command | Role | Analogy |
 |---------|------|---------|
 | `pythond` | daemon process | `sshd` |
-| `pysh` | session client | `ssh` |
+| `pysh` | session client | function call / attach |
 | `pyctl` | daemon control | `systemctl` |
 
 ## Commands
@@ -38,13 +38,13 @@ pysh run <name> "code"       sync exec → raw output
 pysh fire <name> "code"      async (thread) → shares namespace, can't kill C
 pysh fork <name> "code"      async process (POSIX only) → killable, pickles vars back
 pysh poll <name> [cell_id]   check async result
-pysh attach <name>           human REPL (readline, colors, Ctrl-C)
 pysh int <name>              best-effort interrupt (fire=best effort, fork=kill)
 pysh kill <name>             terminate session
 pysh ls                      list sessions
 pysh status <name>           session health (JSON)
 pysh vars <name>             namespace names (JSON)
 pysh complete <name> "text"  tab completion (JSON)
+pysh attach <name>           human REPL (Ctrl-] to detach)
 
 pyctl start [--listen HOST:PORT] [--tls]   start daemon in foreground
 pyctl stop                                 stop daemon
@@ -89,12 +89,35 @@ The agent channel is structured: source code in, captured text/JSON out. It does
 not need to parse ANSI escape sequences, cursor movement, prompts, or screen
 redraws to know when a cell finished.
 
-The human channel is interactive: `pysh attach` connects to the same process
-through PTY or WinPTY. A human can inspect variables, interrupt with Ctrl-C, or
-detach with `Ctrl-]` without discarding the namespace.
+The human channel is interactive: `pysh attach` connects to the same process.
+On POSIX/WSL this is a real PTY byte stream. On native Windows it goes through
+WinPTY, which preserves execution and shared state but is not fully
+byte-transparent for readline screen redraws. A human can inspect variables,
+interrupt with Ctrl-C, or detach with `Ctrl-]` without discarding the namespace.
 
 That split is the core design: pure data for agents, real terminal ergonomics
 for humans, one shared runtime underneath.
+
+## Two Control Surfaces
+
+Use the interface that matches the job:
+
+```bash
+pysh run work "x = 1"     # agent / script: one-shot command, result out
+pysh attach work        # human developer: interactive access to that session
+pyctl status            # operator: daemon status
+```
+
+`pyctl` manages the daemon. `pysh` manages sessions. No command secretly starts
+the daemon, creates a session, and attaches in one step; failures stay in the
+right error domain.
+
+`pysh attach <name>` is transparent on POSIX/WSL: once attached, you are looking
+at the actual Python `>>>` prompt, the same way `tmux attach` leaves you inside
+the real shell. Native Windows attach is a WinPTY console bridge, not the same
+raw PTY primitive; command execution and shared state work, but line-editing
+redraws such as history recall may not display identically. Use WSL when exact
+terminal behaviour matters.
 
 ## Why pythond exists
 
@@ -106,7 +129,8 @@ pysh run work "x + 1"    # → 43
 Code in, result out. Variables survive between calls.
 No terminal. No ANSI. No parsing. Function-call API to a persistent Python namespace.
 
-AI agents use it as their Python runtime. Humans use `pysh attach` for an interactive REPL into the same namespace. Both see the same objects.
+AI agents use it as their Python runtime. Humans use `pysh attach` for an
+interactive REPL into the same namespace. Both see the same objects.
 
 ## Why two daemons (remote proxy)
 
@@ -323,7 +347,7 @@ Runtime files and durable state live in different places:
 | Platform | PTY | Transport | Notes |
 |----------|-----|-----------|-------|
 | Linux/macOS | `pty.openpty()` | AF_UNIX WS | full featured |
-| Windows | `pywinpty` | TCP WS | `pip install pywinpty` |
+| Windows | `pywinpty` | TCP WS | execution/state supported; not raw byte-transparent for readline redraws |
 | WSL | same as Linux | AF_UNIX WS | full featured |
 
 ## Architecture
@@ -335,7 +359,7 @@ daemon process (WebSocket server, keep-alive connections)
   ├── session "work" (subprocess, isolated)
   │     ├── persistent namespace (variables live forever)
   │     ├── AI channel: JSON lines over socketpair
-  │     └── human channel: real PTY (readline, colors)
+  │     └── human channel: POSIX PTY or Windows WinPTY bridge
   ├── session "gpu" (another subprocess)
   └── remote "server" (WebSocket proxy to remote daemon)
 ```

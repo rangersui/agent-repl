@@ -144,8 +144,15 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography import x509
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import datetime as _dt
+import logging
 
 __version__ = "0.3.0"
+
+# Suppress websockets handshake tracebacks (nmap probes, curl, etc.).
+# pythond has its own access log; the library's stderr spam is redundant.
+_ws_logger = logging.getLogger("pythond.ws")
+_ws_logger.addHandler(logging.NullHandler())
+_ws_logger.propagate = False
 JsonDict = dict[str, typing.Any]
 WebSocketLike = typing.Any
 SocketLike = typing.Any
@@ -1030,7 +1037,8 @@ class _TlsTerminatedServer:
         self._ssl_ctx = ssl_ctx
         self._trusted_client_dir = trusted_client_dir
         self._inner = ws_serve(handler, "127.0.0.1", 0,
-                               subprotocols=subprotocols)
+                               subprotocols=subprotocols,
+                               logger=_ws_logger)
         try:
             inner_addr = self._inner.socket.getsockname()
             self._inner_port = inner_addr[1]
@@ -3386,7 +3394,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 server = _set_server(
                     ws_unix_serve(_ws_handler, SOCK,
                                   subprotocols=[_WS_PROTO],
-                                  server_header=None)
+                                  server_header=None,
+                                  logger=_ws_logger)
                 )
             finally:
                 os.umask(old_umask)
@@ -3415,7 +3424,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 server = _set_server(
                     ws_serve(_ws_handler, host, port,
                              subprotocols=[_WS_PROTO],
-                             server_header=None)
+                             server_header=None,
+                             logger=_ws_logger)
                 )
         else:
             print(f"pythond pid={os.getpid()} ws://127.0.0.1:{port} mode={mode}",
@@ -3426,7 +3436,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             server = _set_server(
                 ws_serve(_ws_handler, "127.0.0.1", port,
                          subprotocols=[_WS_PROTO],
-                         server_header=None)
+                         server_header=None,
+                         logger=_ws_logger)
             )
 
         if server is None:

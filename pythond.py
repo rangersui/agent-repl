@@ -1021,15 +1021,17 @@ class _TlsTerminatedServer:
         while not self._stopped.is_set():
             self._reap_threads()
             try:
-                raw, _addr = self._sock.accept()
+                raw, addr = self._sock.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
             if len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS:
+                _access_log("tls", peer=addr, status="capacity-drop",
+                            detail="bridge-thread-limit")
                 raw.close()
                 continue
-            worker = threading.Thread(target=self._handle, args=(raw,),
+            worker = threading.Thread(target=self._handle, args=(raw, addr),
                                       daemon=True)
             worker.start()
             self._bridge_threads.append(worker)
@@ -1051,19 +1053,29 @@ class _TlsTerminatedServer:
         except Exception as e:
             print(f"warn: TLS bridge failed: {type(e).__name__}", file=sys.stderr)
 
-    def _handle(self, raw: socket.socket) -> None:
+    def _handle(self, raw: socket.socket, peer: typing.Any = None) -> None:
         tls_sock = None
         inner_sock = None
         try:
             raw.settimeout(_TLS_BRIDGE_IO_TIMEOUT)
             tls_sock = self._ssl_ctx.wrap_socket(raw, server_side=True)
+            _access_log("tls", peer=peer, status="accepted")
             if self._trusted_client_dir is not None:
-                _verify_peer_fingerprint(tls_sock, self._trusted_client_dir,
-                                         "client")
+                try:
+                    _verify_peer_fingerprint(tls_sock, self._trusted_client_dir,
+                                             "client")
+                    _access_log("mtls", peer=peer, status="ok")
+                except Exception as e:
+                    _access_log("mtls", peer=peer, status="rejected",
+                                detail=e.__class__.__name__)
+                    raise
             inner_sock = socket.create_connection(("127.0.0.1",
                                                    self._inner_port))
             self._bridge(tls_sock, inner_sock)
         except Exception as e:
+            if tls_sock is None:
+                _access_log("tls", peer=peer, status="rejected",
+                            detail=e.__class__.__name__)
             print(f"WARN: TLS connection failed: {e.__class__.__name__}",
                   file=sys.stderr)
         finally:

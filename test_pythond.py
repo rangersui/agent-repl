@@ -1464,12 +1464,21 @@ def test_tls_bridge_handshake_has_timeout():
     old_timeout = pythond._TLS_BRIDGE_IO_TIMEOUT
     pythond._TLS_BRIDGE_IO_TIMEOUT = 0.25
     try:
-        server._handle(raw)
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(pythond, "_runtime_dir", return_value=td), \
+                 mock.patch.object(pythond, "_mirror_access_log_to_stderr"):
+                server._handle(raw, ("127.0.0.1", 1234))
+            access = open(os.path.join(td, "access.log"),
+                          encoding="utf-8").read()
     finally:
         pythond._TLS_BRIDGE_IO_TIMEOUT = old_timeout
     check("raw socket timeout set before TLS handshake", raw.timeout == 0.25,
           raw.timeout)
     check("raw socket closed after failed handshake", raw.closed is True)
+    check("TLS handshake failure is access logged",
+          "event=tls" in access and "status=rejected" in access and
+          "detail=TimeoutError" in access,
+          access)
 
 
 def test_tls_and_auth_hardening_static():
@@ -1754,6 +1763,11 @@ def test_connection_hardening_static():
     check("TLS bridge has connection cap",
           "len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS" in tls_server_seg and
           "self._inner_thread" in tls_server_seg)
+    check("TLS bridge failures are access logged",
+          "_access_log(\"tls\", peer=addr, status=\"capacity-drop\"" in tls_server_seg and
+          "_access_log(\"tls\", peer=peer, status=\"accepted\")" in tls_server_seg and
+          "_access_log(\"tls\", peer=peer, status=\"rejected\"" in tls_server_seg and
+          "_access_log(\"mtls\", peer=peer, status=\"rejected\"" in tls_server_seg)
     check("new_session rolls back failed registration",
           "_close_session_resources(typing.cast(JsonDict, winpty_session))" in new_session_seg and
           "_close_session_resources(typing.cast(JsonDict, pty_session))" in new_session_seg)

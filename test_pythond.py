@@ -2107,15 +2107,28 @@ def test_attach_loop_reports_clean_detach():
 
 
 def test_access_log_sanitises_session_field():
-    section("access log sanitises session field")
+    section("access log sanitises fields")
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(pythond, "_runtime_dir", return_value=td), \
              mock.patch.object(pythond, "_mirror_access_log_to_stderr"):
-            pythond._access_log("command", cmd="run", session="../../secret",
-                                body_bytes=12)
+            pythond._access_log("command\nsplit",
+                                peer=("host\nbad", 123),
+                                cmd="run code",
+                                session="../../secret",
+                                status="bad\tstatus",
+                                body_bytes=12,
+                                detail="line1\nline2\\tail")
         content = open(os.path.join(td, "access.log"), encoding="utf-8").read()
     check("invalid session redacted", "session=invalid" in content, content)
     check("raw invalid session omitted", "../../secret" not in content, content)
+    check("access log remains one physical line", content.count("\n") == 1, content)
+    check("access log escapes control and separator chars",
+          "event=command\\nsplit" in content and
+          "peer=host\\nbad:123" in content and
+          "cmd=run\\scode" in content and
+          "status=bad\\tstatus" in content and
+          "detail=line1\\nline2\\\\tail" in content,
+          content)
 
 
 def test_pyctl_cert_role_hints():

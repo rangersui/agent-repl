@@ -348,27 +348,38 @@ def _access_log(
     was used without leaking tokens or code bodies.  The file is durable local
     evidence; stderr gives supervisors and service managers the live stream.
     """
+    def _log_value(value: object) -> str:
+        text = str(value)
+        return (
+            text
+            .replace("\\", "\\\\")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n")
+            .replace("\t", "\\t")
+            .replace(" ", "\\s")
+        )
+
     def _field(value: str) -> str:
         return value if _SESSION_NAME_RE.fullmatch(value) else "invalid"
 
     fields = [
         "ACCESS",
         f"ts={_utc_timestamp_ms()}",
-        f"event={event}",
+        f"event={_log_value(event)}",
     ]
     if conn_id is not None:
         fields.append(f"conn_id={conn_id}")
-    fields.append(f"peer={_format_peer(peer)}")
+    fields.append(f"peer={_log_value(_format_peer(peer))}")
     if cmd is not None:
-        fields.append(f"cmd={cmd or '-'}")
+        fields.append(f"cmd={_log_value(cmd or '-')}")
     if session is not None:
         fields.append(f"session={_field(session) if session else '-'}")
     if status is not None:
-        fields.append(f"status={status}")
+        fields.append(f"status={_log_value(status)}")
     if body_bytes is not None:
         fields.append(f"body_bytes={body_bytes}")
     if detail is not None:
-        fields.append(f"detail={detail}")
+        fields.append(f"detail={_log_value(detail)}")
     line = " ".join(fields) + "\n"
     try:
         # open-write-close per line: intentional, crash-safe, standard for access logs

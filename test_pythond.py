@@ -1691,6 +1691,8 @@ def test_connection_hardening_static():
     check("send preserves connection error detail",
           "ERR cannot connect: {_public_error(e)}" in send_seg and
           "except Exception:\n        return None" not in send_seg)
+    check("send labels post-connect failures as command failures",
+          "ERR command failed: {_public_error(e)}" in send_seg)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
     check("wsproto is used for WSS framing",
@@ -2342,7 +2344,7 @@ def test_send_reports_recv_failure_detail():
     with mock.patch.object(pythond, "_connect_daemon", return_value=fake):
         resp = pythond._send("ls", [])
     check("recv failure is visible",
-          resp == "ERR cannot connect: websocket rejected", resp)
+          resp == "ERR command failed: websocket rejected", resp)
     check("recv failure closes ws", fake.closed is True)
 
 

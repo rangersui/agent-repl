@@ -3385,7 +3385,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             try:
                 server = _set_server(
                     ws_unix_serve(_ws_handler, SOCK,
-                                  subprotocols=[_WS_PROTO])
+                                  subprotocols=[_WS_PROTO],
+                                  server_header=None)
                 )
             finally:
                 os.umask(old_umask)
@@ -3413,7 +3414,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             else:
                 server = _set_server(
                     ws_serve(_ws_handler, host, port,
-                             subprotocols=[_WS_PROTO])
+                             subprotocols=[_WS_PROTO],
+                             server_header=None)
                 )
         else:
             print(f"pythond pid={os.getpid()} ws://127.0.0.1:{port} mode={mode}",
@@ -3423,7 +3425,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 print(f"{tok_cmd} PYTHOND_TOKEN={_daemon_token}", file=sys.stderr)
             server = _set_server(
                 ws_serve(_ws_handler, "127.0.0.1", port,
-                         subprotocols=[_WS_PROTO])
+                         subprotocols=[_WS_PROTO],
+                         server_header=None)
             )
 
         if server is None:
@@ -3447,6 +3450,8 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
                 signal.signal(signal.SIGBREAK, old_sigbreak)
             except (AttributeError, ValueError):
                 pass  # signal not available on this platform
+        # server first: stop new connections and drain in-flight handlers.
+        # session cleanup uses internal resources (fds, processes), not the server.
         try:
             if server is not None:
                 server.shutdown()
@@ -3492,7 +3497,7 @@ def _send(cmd: str, args: list[str]) -> str | None:
             ws.close()
         except Exception:
             pass  # connection close failed while reporting original error
-        return f"ERR cannot connect: {_public_error(e)}"
+        return f"ERR command failed: {_public_error(e)}"
 
 def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
     """CLI client for non-interactive commands.

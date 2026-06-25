@@ -1057,7 +1057,7 @@ def test_tcp_daemon_alive_does_not_parse_error_text():
             self.closed = True
 
     fake = FakeWs()
-    with mock.patch("websockets.sync.client.connect", return_value=fake):
+    with mock.patch.object(pythond, "ws_connect", return_value=fake):
         alive = pythond._tcp_daemon_alive({"port": 7399, "token": "bad"})
     check("error response still means endpoint alive", alive is True)
     check("probe sent ls", fake.sent == ["ls"], fake.sent)
@@ -1072,9 +1072,6 @@ def test_cert_fingerprint_missing():
 
 def test_cert_generation():
     section("cert generation")
-    if not pythond._HAS_CRYPTO:
-        check("skip (no cryptography)", True)
-        return
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(pythond, "_tls_dir", return_value=td):
             cert, key = pythond._generate_cert()
@@ -1118,9 +1115,6 @@ def test_cert_generation():
 
 def test_trust_cert_exact_fingerprint_store():
     section("trust cert exact fingerprint store")
-    if not pythond._HAS_CRYPTO:
-        check("skip (no cryptography)", True)
-        return
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(pythond, "_tls_dir", return_value=td):
             cert, _key = pythond._generate_cert()
@@ -1142,25 +1136,11 @@ def test_trust_cert_exact_fingerprint_store():
             except ValueError:
                 check("invalid direction rejected", True)
 
-
-def test_cert_generation_no_crypto():
-    section("cert generation without cryptography")
-    with mock.patch.object(pythond, "_HAS_CRYPTO", False):
-        try:
-            pythond._generate_cert()
-            check("should have raised", False)
-        except RuntimeError as e:
-            check("error mentions pip install", "pip install pythond" in str(e))
-
-
 def test_websocket_protocol():
     section("WebSocket protocol")
-    # verify websockets is importable
-    from websockets.sync.client import connect as ws_connect
-    check("ws_connect exists", callable(ws_connect))
+    check("ws_connect exists", callable(pythond.ws_connect))
     if _HAS_AF_UNIX:
-        from websockets.sync.client import unix_connect as ws_unix
-        check("ws_unix_connect exists", callable(ws_unix))
+        check("ws_unix_connect exists", callable(pythond.ws_unix_connect))
 
 
 def test_wire_message_builder():
@@ -1776,8 +1756,8 @@ def test_connection_hardening_static():
           "server_pins = _trusted_fingerprints(_trusted_servers_dir())" in src and
           "_WsproClient.connect(\n        host,\n        port,\n        ctx,\n        token,\n        timeout,\n        server_pins," in src and
           "_trusted_fingerprints(" not in wspro_seg)
-    check("cert key validation tolerates missing crypto",
-          "except (AttributeError, NameError, OSError, TypeError, ValueError):" in cert_gen_seg)
+    check("cert key validation handles invalid files",
+          "except (AttributeError, OSError, TypeError, ValueError):" in cert_gen_seg)
     check("trusted cert load skips unreadable certs",
           "except (_ssl.SSLError, OSError):" in src)
     check("trusted certs reject CA-capable certs",
@@ -1966,11 +1946,10 @@ def test_connection_hardening_static():
     check("connect_remote rejects close during probe",
           "if resp is _WS_CLOSE:" in connect_remote_seg and
           "remote closed during probe" in connect_remote_seg)
-    pre_host_seg = connect_daemon_seg.split("host = os.environ.get(\"PYTHOND_HOST\")", 1)[0]
-    check("daemon connector delays websockets import",
-          "from websockets.sync.client import unix_connect" not in pre_host_seg and
-          connect_daemon_seg.index("if host:") <
-          connect_daemon_seg.index("from websockets.sync.client import unix_connect"))
+    check("websocket dependencies are hard imports",
+          "from websockets.sync.client import connect as ws_connect" in src and
+          "from websockets.sync.client import unix_connect as ws_unix_connect" in src and
+          "websockets required: pip install pythond" not in src)
     check("daemon connector validates fallback port",
           "if not (1 <= port <= 65535):" in connect_daemon_seg)
     check("default socket fallback uses private runtime dir",
@@ -2080,17 +2059,6 @@ def test_connection_hardening_static():
           daemon_full_seg.index("args.append(body)") and
           "body_bytes=body_len" in daemon_full_seg and
           "detail=body" not in daemon_full_seg)
-
-
-def test_has_crypto_flag():
-    section("_HAS_CRYPTO flag")
-    check("_HAS_CRYPTO is bool", isinstance(pythond._HAS_CRYPTO, bool))
-    try:
-        import cryptography
-        check("cryptography installed -> flag True", pythond._HAS_CRYPTO is True)
-    except ImportError:
-        check("cryptography missing -> flag False", pythond._HAS_CRYPTO is False)
-
 
 def test_entry_points_exist():
     section("entry points")
@@ -2731,10 +2699,6 @@ def test_integration_tls_pinned_server():
     """Real wss:// connection with a pinned daemon certificate."""
     section("INTEGRATION: TLS pinned server")
 
-    if not pythond._HAS_CRYPTO:
-        check("tls e2e skipped without cryptography", True)
-        return
-
     port = free_tcp_port()
     with tempfile.TemporaryDirectory() as server_home, tempfile.TemporaryDirectory() as client_tls:
         env = os.environ.copy()
@@ -3332,7 +3296,6 @@ def main():
         test_cert_fingerprint_missing,
         test_cert_generation,
         test_trust_cert_exact_fingerprint_store,
-        test_cert_generation_no_crypto,
         test_websocket_protocol,
         test_wire_message_builder,
         test_send_remote_transparent_alias,
@@ -3349,7 +3312,6 @@ def main():
         test_tls_bridge_handshake_has_timeout,
         test_tls_and_auth_hardening_static,
         test_connection_hardening_static,
-        test_has_crypto_flag,
         test_entry_points_exist,
         test_session_cli_errors_exit_nonzero,
         test_attach_loop_reports_stream_failure,

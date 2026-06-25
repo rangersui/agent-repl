@@ -135,6 +135,15 @@ import wsproto
 from wsproto import ConnectionType
 from wsproto import events as ws_events
 from wsproto.utilities import LocalProtocolError
+from websockets.sync.client import connect as ws_connect
+from websockets.sync.client import unix_connect as ws_unix_connect
+from websockets.sync.server import serve as ws_serve
+from websockets.sync.server import unix_serve as ws_unix_serve
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography import x509
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+import datetime as _dt
 
 __version__ = "0.3.0"
 JsonDict = dict[str, typing.Any]
@@ -540,7 +549,6 @@ def _tcp_daemon_alive(meta: JsonDict) -> bool:
         return False
     ws = None
     try:
-        from websockets.sync.client import connect as ws_connect
         ws = ws_connect(f"ws://127.0.0.1:{port}/",
                         additional_headers=_auth_headers(token or None),
                         proxy=None,
@@ -566,7 +574,6 @@ def _unix_daemon_alive() -> bool:
     if not os.path.exists(SOCK):
         return False
     try:
-        from websockets.sync.client import unix_connect as ws_unix_connect
         ws = ws_unix_connect(SOCK, open_timeout=2, close_timeout=1,
                              subprotocols=[_WS_PROTO])
         try:
@@ -649,23 +656,12 @@ def _remove_daemon_meta() -> None:
               file=sys.stderr)
 
 # -----------------------------------------------
-# TLS (optional, for --listen remote mode)
-#   pip install pythond  ->  adds cryptography
+# TLS (for --listen remote mode)
 # -----------------------------------------------
 
 import ssl as _ssl
 import hashlib as _hashlib
 import ipaddress as _ipaddress
-
-try:
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives import serialization, hashes
-    from cryptography import x509
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-    import datetime as _dt
-    _HAS_CRYPTO = True
-except ImportError:
-    _HAS_CRYPTO = False
 
 def _tls_dir() -> str:
     """Return ~/.pythond/tls/, creating if needed."""
@@ -673,13 +669,7 @@ def _tls_dir() -> str:
     return _ensure_private_dir(os.path.join(home, "tls"))
 
 def _generate_cert() -> tuple[str, str]:
-    """Auto-generate self-signed RSA cert+key. Returns (cert_path, key_path).
-
-    Requires `pip install pythond` (cryptography package).
-    """
-    if not _HAS_CRYPTO:
-        raise RuntimeError(
-            "TLS requires the cryptography package: pip install pythond")
+    """Auto-generate self-signed RSA cert+key. Returns (cert_path, key_path)."""
     d = _tls_dir()
     cert_path = os.path.join(d, "cert.pem")
     key_path = os.path.join(d, "key.pem")
@@ -798,7 +788,7 @@ def _cert_key_pair_valid(cert_path: str, key_path: str) -> bool:
         cert_public = typing.cast(typing.Any, cert.public_key())
         key_public = typing.cast(typing.Any, key.public_key())
         return cert_public.public_numbers() == key_public.public_numbers()
-    except (AttributeError, NameError, OSError, TypeError, ValueError):
+    except (AttributeError, OSError, TypeError, ValueError):
         return False
 
 def _cert_fingerprint(cert_path: str) -> str:
@@ -829,8 +819,6 @@ def _normalise_fingerprint(value: str) -> str:
 
 def _cert_ca_capable(cert_path: str) -> bool:
     """Return True when a cert can act as a CA or cannot be inspected."""
-    if not _HAS_CRYPTO:
-        return True
     try:
         with open(cert_path, "rb") as f:
             return _cert_pem_bytes_ca_capable(f.read())
@@ -839,8 +827,6 @@ def _cert_ca_capable(cert_path: str) -> bool:
 
 def _cert_pem_bytes_ca_capable(pem: bytes) -> bool:
     """Return True when an in-memory cert can act as a CA or is invalid."""
-    if not _HAS_CRYPTO:
-        return True
     try:
         cert = x509.load_pem_x509_certificate(pem)
         try:
@@ -2694,10 +2680,6 @@ def _open_remote_ws(
     """Open one daemon WebSocket to HOST:PORT using the project TLS rules."""
     if use_tls:
         return _connect_wss(host, port, token, timeout=timeout)
-    try:
-        from websockets.sync.client import connect as ws_connect
-    except ImportError:
-        raise RuntimeError("websockets required: pip install pythond")
     return ws_connect(f"ws://{host}:{port}/",
                       additional_headers=_auth_headers(token),
                       proxy=None,
@@ -2716,10 +2698,6 @@ def _connect_daemon(timeout: float = 5) -> WebSocketLike:
         h, port = _parse_host_port(host)
         return _open_remote_ws(h, port, token, use_tls=use_tls, timeout=timeout)
     if _HAS_AF_UNIX:
-        try:
-            from websockets.sync.client import unix_connect as ws_unix_connect
-        except ImportError:
-            raise RuntimeError("websockets required for local AF_UNIX connections: pip install pythond")
         return ws_unix_connect(SOCK, open_timeout=timeout, close_timeout=2,
                                subprotocols=[_WS_PROTO])
 
@@ -3122,15 +3100,6 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
       ls                 -> text listing
     Python code is never escaped -- it goes after the first \\n as-is.
     """
-    try:
-        from websockets.sync.server import serve as ws_serve
-        if _HAS_AF_UNIX:
-            from websockets.sync.server import unix_serve as ws_unix_serve
-    except ImportError:
-        print("ERR websockets required: pip install pythond",
-              file=sys.stderr)
-        raise SystemExit(1)
-
     global _daemon_token, _daemon_server
     _daemon_server = None
     ssl_ctx = None
@@ -3913,9 +3882,6 @@ def pyctl_main() -> None:
     elif args.command == "disconnect":
         client("disconnect", [args.name], fail_on_err=True)
     elif args.command == "trust":
-        if not _HAS_CRYPTO:
-            print("ERR: pip install pythond", file=sys.stderr)
-            sys.exit(1)
         try:
             dest, fp = trust_cert(args.cert, direction="client")
         except RuntimeError as e:
@@ -3924,9 +3890,6 @@ def pyctl_main() -> None:
         print(f"trusted client: {fp}")
         print(f"  -> {dest}")
     elif args.command == "pin":
-        if not _HAS_CRYPTO:
-            print("ERR: pip install pythond", file=sys.stderr)
-            sys.exit(1)
         try:
             dest, fp = trust_cert(args.cert, direction="server")
         except RuntimeError as e:
@@ -3935,9 +3898,6 @@ def pyctl_main() -> None:
         print(f"pinned server: {fp}")
         print(f"  -> {dest}")
     elif args.command == "cert":
-        if not _HAS_CRYPTO:
-            print("ERR: pip install pythond", file=sys.stderr)
-            sys.exit(1)
         cert, key = _generate_cert()
         fp = _cert_fingerprint(cert)
         print("this machine's TLS certificate:")

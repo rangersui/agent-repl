@@ -1127,6 +1127,12 @@ def test_trust_cert_exact_fingerprint_store():
             fp_path = dest + ".fingerprint"
             check("trusted PEM copied", os.path.exists(dest))
             check("fingerprint file written", os.path.exists(fp_path))
+            with open(cert, "rb") as f:
+                source_bytes = f.read()
+            with open(dest, "rb") as f:
+                dest_bytes = f.read()
+            check("trusted PEM matches enrolled snapshot",
+                  dest_bytes == source_bytes)
             check("trusted fingerprint exact",
                   fp in pythond._trusted_fingerprints(pythond._trusted_servers_dir()))
             try:
@@ -1732,6 +1738,11 @@ def test_connection_hardening_static():
     check("trusted certs reject CA-capable certs",
           "refusing CA-capable certificate" in trust_cert_seg and
           "skipping CA-capable cert" in src)
+    check("trust cert enrollment reads source once",
+          "cert_bytes = f.read()" in trust_cert_seg and
+          "_cert_fingerprint(cert_path)" not in trust_cert_seg and
+          "_cert_ca_capable(cert_path)" not in trust_cert_seg and
+          "shutil.copy2" not in trust_cert_seg)
     check("cert partial replace is invalidated",
           "for fpath in (tmp_key, tmp_cert, key_path, cert_path):" in cert_gen_seg)
     check("self-signed cert is not a CA",

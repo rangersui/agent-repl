@@ -795,11 +795,14 @@ def _cert_fingerprint(cert_path: str) -> str:
     """Return SHA-256 fingerprint of cert for pinning."""
     try:
         with open(cert_path, "rb") as f:
-            der = _ssl.PEM_cert_to_DER_cert(f.read().decode())
-        digest = _hashlib.sha256(der).hexdigest().upper()
-        return ":".join(digest[i:i+2] for i in range(0, len(digest), 2))
+            return _cert_fingerprint_pem_bytes(f.read())
     except (OSError, ValueError):
         return "unknown"
+
+def _cert_fingerprint_pem_bytes(pem: bytes) -> str:
+    """Return SHA-256 fingerprint of one PEM certificate buffer."""
+    der = _ssl.PEM_cert_to_DER_cert(pem.decode("ascii"))
+    return _cert_fingerprint_der(der)
 
 def _cert_fingerprint_der(der: bytes) -> str:
     """Return colon-separated SHA-256 fingerprint for DER certificate bytes."""
@@ -820,7 +823,16 @@ def _cert_ca_capable(cert_path: str) -> bool:
         return True
     try:
         with open(cert_path, "rb") as f:
-            cert = x509.load_pem_x509_certificate(f.read())
+            return _cert_pem_bytes_ca_capable(f.read())
+    except (OSError, ValueError):
+        return True
+
+def _cert_pem_bytes_ca_capable(pem: bytes) -> bool:
+    """Return True when an in-memory cert can act as a CA or is invalid."""
+    if not _HAS_CRYPTO:
+        return True
+    try:
+        cert = x509.load_pem_x509_certificate(pem)
         try:
             basic = cert.extensions.get_extension_for_class(
                 x509.BasicConstraints
@@ -838,7 +850,7 @@ def _cert_ca_capable(cert_path: str) -> bool:
         except x509.ExtensionNotFound:
             pass
         return False
-    except (OSError, ValueError):
+    except ValueError:
         return True
 
 def _trusted_fingerprints(directory: str) -> set[str]:
@@ -923,16 +935,28 @@ def trust_cert(cert_path: str, direction: str = "client") -> tuple[str, str]:
     if direction not in ("client", "server"):
         raise ValueError("direction must be 'client' or 'server'")
     td = _trusted_clients_dir() if direction == "client" else _trusted_servers_dir()
-    fp = _cert_fingerprint(cert_path)
-    if fp == "unknown":
+    try:
+        with open(cert_path, "rb") as f:
+            cert_bytes = f.read()
+        fp = _cert_fingerprint_pem_bytes(cert_bytes)
+    except (OSError, UnicodeDecodeError, ValueError):
         raise RuntimeError("invalid certificate")
-    if _cert_ca_capable(cert_path):
+    if _cert_pem_bytes_ca_capable(cert_bytes):
         raise RuntimeError("refusing CA-capable certificate")
     name = fp.replace(":", "")[:16] + ".pem"
     dest = os.path.join(td, name)
     fp_dest = os.path.join(td, name + ".fingerprint")
-    import shutil
-    shutil.copy2(cert_path, dest)
+    cert_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_BINARY"):
+        cert_flags |= os.O_BINARY
+    fd = os.open(dest, cert_flags, 0o600)
+    try:
+        os.write(fd, cert_bytes)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if sys.platform != "win32":
+        os.chmod(dest, 0o600)
     fd = os.open(fp_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, (fp + "\n").encode("ascii"))

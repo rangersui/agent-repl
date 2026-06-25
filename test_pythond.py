@@ -1519,6 +1519,7 @@ def test_connection_hardening_static():
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
     private_dir_seg = src[src.index("def _ensure_private_dir("):src.index("def _session_dir(")]
     secure_win_seg = src[src.index("def _secure_path_win32("):src.index("def _runtime_dir(")]
+    safe_runtime_base_seg = src[src.index("def _safe_posix_runtime_base("):src.index("def _runtime_dir(")]
     log_seg = src[src.index("def _log_history("):src.index("# -----------------------------------------------\n# SOCKET helpers")]
     set_session_seg = src[src.index("def _set_session("):src.index("def _ensure_session_capacity(")]
     trust_cert_seg = src[src.index("def trust_cert("):src.index("class _Servable")]
@@ -1679,6 +1680,13 @@ def test_connection_hardening_static():
     check("private dir rejects Windows reparse points",
           "GetFileAttributesW" in private_dir_seg and
           "_WIN_FILE_ATTRIBUTE_REPARSE_POINT" in private_dir_seg)
+    check("default socket validates XDG runtime dir",
+          "_safe_posix_runtime_base(xdg)" in default_sock_seg and
+          "os.path.isdir(xdg)" not in default_sock_seg)
+    check("XDG runtime dir requires owner private non-symlink",
+          "os.lstat(path)" in safe_runtime_base_seg and
+          "st.st_uid == os.getuid()" in safe_runtime_base_seg and
+          "stat.S_IMODE(st.st_mode) == 0o700" in safe_runtime_base_seg)
     check("windows path hardening catches icacls timeout",
           "subprocess.TimeoutExpired" in src and "def _secure_path_win32" in src)
     check("windows path hardening fails closed",
@@ -2216,6 +2224,21 @@ def test_default_sock():
                   os.path.basename(path) == "pythond.sock" and
                   os.path.basename(os.path.dirname(path)) ==
                   f"pythond-{os.getuid()}")
+        with tempfile.TemporaryDirectory() as td:
+            original = os.environ.get("XDG_RUNTIME_DIR")
+            os.chmod(td, 0o755)
+            try:
+                os.environ["XDG_RUNTIME_DIR"] = td
+                unsafe = pythond._default_sock()
+            finally:
+                if original is None:
+                    os.environ.pop("XDG_RUNTIME_DIR", None)
+                else:
+                    os.environ["XDG_RUNTIME_DIR"] = original
+            check("unsafe XDG runtime dir falls back",
+                  os.path.basename(os.path.dirname(unsafe)) ==
+                  f"pythond-{os.getuid()}",
+                  unsafe)
 
 
 def test_secure_path_win32():

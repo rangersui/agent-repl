@@ -2913,12 +2913,6 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
         else:
             inner_args = [" ".join(inner_args)]
     src = _command_source(inner_args) if cmd in ("run", "fire", "fork") else ""
-    if src:
-        lines = src.strip().splitlines()
-        pfx = f"{name}>>> " if len(_session_snapshot()) > 1 else ">>> "
-        cont = "." * len(pfx.rstrip()) + " "
-        for i, ln in enumerate(lines):
-            print(f"{pfx if i == 0 else cont}{ln}", file=sys.stderr)
     resp = send_session(name, {"cmd": cmd, "args": inner_args})
     if not isinstance(resp, dict):
         return str(resp)
@@ -2938,8 +2932,6 @@ def _handle_session_command(cmd: str, args: list[str]) -> str:
 
     if list(resp.keys()) == ["output"]:
         result = resp["output"]
-        if cmd == "run" and result:
-            print(result, file=sys.stderr)
         return str(result)
     return json.dumps(resp)
 

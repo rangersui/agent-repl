@@ -215,10 +215,6 @@ and mirrored to daemon stderr for supervisors. They include <code>conn_id</code>
 <code>cmd</code>, session, status, and <code>body_bytes</code>; they do not include tokens
 or Python code bodies.</p>
 
-<p>Interactive <code>pysh run/fire/fork</code> also echoes submitted code, errors,
-and raw <code>run</code> output to the client terminal's stderr. That is operator
-feedback, not daemon access logging.</p>
-
 <p>Session names are lowercase only: <code>a-z</code>, <code>0-9</code>,
 underscore, and hyphen, up to 80 characters. Windows reserved device names such
 as <code>CON</code>, <code>NUL</code>, <code>COM1</code>, and <code>LPT1</code>

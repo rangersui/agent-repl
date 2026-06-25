@@ -215,8 +215,6 @@ Treat pythond like SSH into a Python runtime.
 - Daemon access logs are written to runtime `access.log` and mirrored to daemon stderr.
   They include `conn_id`, peer, `cmd`, session, status, and `body_bytes`; they
   do not include token values or Python code bodies.
-- Interactive `pysh run/fire/fork` echoes submitted code, errors, and raw `run`
-  output to the client terminal's stderr. Treat that as visible operator output.
 
 Runtime files and durable state are separate:
 

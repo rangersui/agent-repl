@@ -282,9 +282,6 @@ Logs:
 
 - `ACCESS ...` lines are mirrored to daemon stderr for systemd/supervisor/journald.
 - The same access events are appended to the runtime `access.log`.
-- Interactive `pysh run/fire/fork` also echoes submitted code, errors, and raw
-  `run` output to the client terminal's stderr. That is operator feedback, not
-  daemon access logging.
 - Per-session activity goes to `~/.pythond/sessions/<name>/session.log`.
 - Successful replayable sync execs go to `~/.pythond/sessions/<name>/history.py`.
 - Successful async execs go there when `poll` observes completion.

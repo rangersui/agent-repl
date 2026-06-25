@@ -1433,6 +1433,7 @@ def test_tls_and_auth_hardening_static():
     src = (ROOT / "pythond.py").read_text(encoding="utf-8")
     access_log_seg = src[src.index("def _access_log("):src.index("def _ensure_private_dir(")]
     access_mirror_seg = src[src.index("def _access_stderr_worker("):src.index("def _access_log(")]
+    handle_session_command_seg = src[src.index("def _handle_session_command("):src.index("_CONTROL_HANDLERS")]
     check("constant-time token compare", "hmac.compare_digest" in src)
     check("mTLS keeps token auth", "addition to token auth" in src)
     check("binary command frame returns error",
@@ -1454,6 +1455,9 @@ def test_tls_and_auth_hardening_static():
           "_ACCESS_STDERR_QUEUE.put_nowait(line)" in access_mirror_seg and
           "threading.Thread(target=_access_stderr_worker, daemon=True)" in access_mirror_seg and
           "sys.stderr.write(line)" in access_mirror_seg)
+    check("session commands do not echo code or output to daemon stderr",
+          "pfx = f\"{name}>>> \"" not in handle_session_command_seg and
+          "print(result, file=sys.stderr)" not in handle_session_command_seg)
     check("access log sanitises invalid session names",
           "_field(session)" in access_log_seg and "invalid" in access_log_seg)
     ctx = pythond._client_ssl_ctx()
